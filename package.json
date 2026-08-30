@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-github-extended",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Browse GitHub issues, pull requests, and Dependabot alerts in BB.",
   "type": "module",
   "license": "MIT",
@@ -21,6 +21,9 @@
     },
     "server": "./src/server.ts",
     "app": "./src/app.tsx"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
   },
   "scripts": {
     "build": "node scripts/clean-dist.mjs && bb plugin build",
@@ -58,7 +61,6 @@
     "react-dom": "^19.0.0",
     "sonner": "^1.7.4",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vitest": "^4.1.1",
-    "zod": "^4.3.6"
+    "vitest": "^4.1.1"
   }
 }
