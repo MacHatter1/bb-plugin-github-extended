@@ -460,6 +460,11 @@ function isTransientGithubError(error: unknown): boolean {
   return /timeout|timed out|network|connection|econn|enotfound|could not resolve|temporarily unavailable|service unavailable|rate limit|keychain/i.test(message);
 }
 
+function isKnownDependabotUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Dependabot alerts are disabled|admin:repo_hook/i.test(message);
+}
+
 /** gh's own wording when it holds no credentials for the host. */
 const GH_NO_CREDENTIALS = /no oauth token|not logged in/i;
 const GH_HOST = "github.com";
@@ -1079,6 +1084,7 @@ export default async function plugin(bb: BbPluginApi) {
   let lastKnownProjectRepos: RepoInfo[] = [];
   let ignoredExtraRepos: string[] = [];
   let lastIgnoredExtraReposKey: string | null = null;
+  const reportedDiscoveryFailures = new Map<string, string>();
   let persistenceCleanup: ((repos: RepoInfo[], projectDiscoveryOk: boolean, trackingChanged: boolean, expectedGeneration: number) => Promise<void>) | null = null;
   let discoveryGeneration = 0;
   let discoveryQueue: Promise<void> = Promise.resolve();
@@ -1114,6 +1120,7 @@ export default async function plugin(bb: BbPluginApi) {
     let projectDiscoveryOk = true;
     try {
       const projects = (await bb.sdk.projects.list()) as unknown as BbProjectSummary[];
+      reportedDiscoveryFailures.delete("project-list");
       for (const project of projects) {
         for (const source of project.sources ?? []) {
           if (source.type !== "local_path") continue;
@@ -1123,23 +1130,28 @@ export default async function plugin(bb: BbPluginApi) {
               ["-C", source.path, "remote", "get-url", "origin"],
               5_000,
             );
+            reportedDiscoveryFailures.delete(source.path);
             const repo = parseGithubRemote(stdout);
             if (repo !== null && !byRepo.has(repo)) {
               byRepo.set(repo, { repo, projectId: project.id });
             }
           } catch (error) {
             projectDiscoveryOk = false;
-            bb.log.warn(
-              `git remote discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
+            const message = error instanceof Error ? error.message : String(error);
+            if (reportedDiscoveryFailures.get(source.path) !== message) {
+              bb.log.warn(`git remote discovery failed: ${message}`);
+              reportedDiscoveryFailures.set(source.path, message);
+            }
           }
         }
       }
     } catch (error) {
       projectDiscoveryOk = false;
-      bb.log.warn(
-        `project discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      if (reportedDiscoveryFailures.get("project-list") !== message) {
+        bb.log.warn(`project discovery failed: ${message}`);
+        reportedDiscoveryFailures.set("project-list", message);
+      }
     }
     if (projectDiscoveryOk) {
       lastKnownProjectRepos = [...byRepo.values()].filter(
@@ -1420,7 +1432,14 @@ export default async function plugin(bb: BbPluginApi) {
 
 
   type RepoHealth = z.infer<typeof repoHealthSchema>;
-  type DependabotSyncResult = { items: number; itemsOk: boolean; alertsOk: boolean; error: string | null; skipped?: boolean };
+  type DependabotSyncResult = {
+    items: number;
+    itemsOk: boolean;
+    alertsOk: boolean;
+    retryable: boolean;
+    error: string | null;
+    skipped?: boolean;
+  };
 
   function emptyRepoHealth(): RepoHealth {
     return {
@@ -1575,6 +1594,7 @@ export default async function plugin(bb: BbPluginApi) {
   // ponytail: one global sync queue is enough for this single plugin process;
   // use per-account generations if concurrent full refresh throughput matters.
   let syncAllQueue: Promise<void> = Promise.resolve();
+  const reportedDependabotFailures = new Map<string, string>();
   function withSyncLock<T>(operation: () => Promise<T>): Promise<T> {
     const result = syncAllQueue.then(operation);
     syncAllQueue = result.then(() => undefined, () => undefined);
@@ -1599,6 +1619,7 @@ export default async function plugin(bb: BbPluginApi) {
     let alertCount = 0;
     let itemsOk = false;
     let alertsOk = false;
+    let retryable = false;
     let items: CachedItem[] | null = null;
     let alerts: DependabotRow[] | null = null;
     const errors: string[] = [];
@@ -1610,6 +1631,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`items: ${message}`);
+      retryable = true;
       bb.log.warn(`sync failed for ${repo}: ${message}`);
     }
 
@@ -1617,10 +1639,20 @@ export default async function plugin(bb: BbPluginApi) {
       alerts = await fetchRepoDependabotAlerts(gh, repo);
       alertCount = alerts.length;
       alertsOk = true;
+      reportedDependabotFailures.delete(repo);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`Dependabot: ${message}`);
-      bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+      if (isKnownDependabotUnavailable(error)) {
+        if (reportedDependabotFailures.get(repo) !== message) {
+          bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+          reportedDependabotFailures.set(repo, message);
+        }
+      } else {
+        reportedDependabotFailures.delete(repo);
+        retryable = true;
+        bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+      }
     }
 
     // GitHub calls may outlive a tracking change. Do not commit a response
@@ -1630,6 +1662,7 @@ export default async function plugin(bb: BbPluginApi) {
         items: 0,
         itemsOk: true,
         alertsOk: true,
+        retryable: false,
         error: null,
         skipped: true,
       };
@@ -1664,19 +1697,42 @@ export default async function plugin(bb: BbPluginApi) {
       items: itemCount,
       itemsOk,
       alertsOk,
+      retryable,
       error: errors.length > 0 ? errors.join(" | ") : null,
     };
   }
 
-  async function syncRepository(repo: string): Promise<DependabotSyncResult> {
-    const currentRepos = await discoverRepos(true, false);
-    const expectedGeneration = discoveryGeneration;
-    if (!currentRepos.some((entry) => entry.repo === repo)) {
-      return { items: 0, itemsOk: true, alertsOk: true, error: null, skipped: true };
+  async function syncRepository(
+    repo: string,
+    expectedGeneration = discoveryGeneration,
+  ): Promise<DependabotSyncResult> {
+    if (
+      expectedGeneration !== discoveryGeneration ||
+      repoCache === null ||
+      !repoCache.repos.some((entry) => entry.repo === repo)
+    ) {
+      return {
+        items: 0,
+        itemsOk: true,
+        alertsOk: true,
+        retryable: false,
+        error: null,
+        skipped: true,
+      };
     }
     return withRepoWriteLock(repo, async () => {
-      if (expectedGeneration !== discoveryGeneration || repoCache?.repos.every((entry) => entry.repo !== repo)) {
-        return { items: 0, itemsOk: true, alertsOk: true, error: null, skipped: true };
+      if (
+        expectedGeneration !== discoveryGeneration ||
+        repoCache?.repos.every((entry) => entry.repo !== repo)
+      ) {
+        return {
+          items: 0,
+          itemsOk: true,
+          alertsOk: true,
+          retryable: false,
+          error: null,
+          skipped: true,
+        };
       }
       return await syncRepositoryUnsafe(repo, expectedGeneration);
     });
@@ -1719,7 +1775,9 @@ export default async function plugin(bb: BbPluginApi) {
         errors: db
           .prepare("SELECT repo, message FROM dependabot_sync_errors ORDER BY repo")
           .all(),
-        health: db.prepare("SELECT * FROM repo_sync_health ORDER BY repo").all(),
+        health: db
+          .prepare("SELECT repo, status, item_count, alert_count, error FROM repo_sync_health ORDER BY repo")
+          .all(),
       });
     const before = snapshot();
     const initialRepoSet = repoSetKey(repos);
@@ -1728,10 +1786,10 @@ export default async function plugin(bb: BbPluginApi) {
     let incomplete = 0;
     let lastFailure = "";
     for (const { repo } of repos) {
-      const result = await syncRepository(repo);
+      const result = await syncRepository(repo, initialGeneration);
       if (result.skipped) continue;
       total += result.items;
-      if (!result.itemsOk || !result.alertsOk) {
+      if (result.retryable) {
         incomplete += 1;
         lastFailure = result.error ?? "unknown repository sync failure";
       }
@@ -2234,7 +2292,7 @@ export default async function plugin(bb: BbPluginApi) {
         await requireTrackedRepo(repo);
         const repos = await discoverRepos();
         const initialGeneration = discoveryGeneration;
-        const result = await syncRepository(repo);
+        const result = await syncRepository(repo, initialGeneration);
         const currentRepos = await discoverRepos(true);
         if (
           result.skipped ||
@@ -2243,7 +2301,7 @@ export default async function plugin(bb: BbPluginApi) {
         ) {
           throw ghUnavailable(`repository tracking changed during refresh for ${repo}; retry`);
         }
-        if (!result.itemsOk || !result.alertsOk) {
+        if (result.retryable) {
           bb.realtime.publish("data-changed", { items: result.items });
           throw ghUnavailable(result.error ?? `sync failed for ${repo}`);
         }

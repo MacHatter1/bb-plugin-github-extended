@@ -9,13 +9,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
 
 let binDir: string;
 let partialFlag: string;
 let accessDeniedFlag: string;
+let dependabotDisabledFlag: string;
 let callLog: string;
 const originalPath = process.env.PATH;
 
@@ -28,6 +29,7 @@ beforeEach(() => {
   binDir = mkdtempSync(join(tmpdir(), "bb-github-rpc-"));
   partialFlag = join(binDir, "gh-partial");
   accessDeniedFlag = join(binDir, "gh-access-denied");
+  dependabotDisabledFlag = join(binDir, "gh-dependabot-disabled");
   callLog = join(binDir, "gh-calls.log");
   const openIssue = JSON.stringify([
     {
@@ -178,6 +180,7 @@ case "$*" in
   "api repos/acme/widgets") if [ -e "${accessDeniedFlag}" ]; then echo "repository access denied" >&2; exit 1; else printf '%s\\n' '{}'; fi;;
   "api repos/acme/widgets/assignees?per_page=100") printf '%s\n' '[{"login":"zoe"},{"login":"alice"},{"login":""}]';;
   "api repos/acme/widgets/labels?per_page=100") printf '%s\n' '[{"name":"triage"},{"name":" bug "},{"name":""}]';;
+  "api --paginate --jq .[] repos/acme/widgets/dependabot/alerts?state=open&per_page=100") if [ -e "${dependabotDisabledFlag}" ]; then echo "gh: Dependabot alerts are disabled for this repository. (HTTP 403)" >&2; exit 1; else printf '%s\n' '[]'; fi;;
   "issue list -R acme/widgets --state open"*) printf '%s\n' '${openIssue}';;
   "issue list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
   "issue list -R other/repo --state open"*) if [ -e "${partialFlag}" ]; then echo "partial sync failure" >&2; exit 1; else printf '%s\\n' '[]'; fi;;
@@ -266,6 +269,91 @@ describe("github plugin RPC behavior", () => {
         entry.message.includes("extraRepos"),
       ),
     ).toEqual([]);
+  });
+
+  it("does not retry or reject a known unavailable Dependabot repository", async () => {
+    const { bb, harness } = await loadPlugin();
+    writeFileSync(dependabotDisabledFlag, "");
+
+    await expect(harness.callRpc("refresh")).resolves.toEqual({
+      repos: 1,
+      items: 2,
+    });
+    await expect(harness.callRpc("refresh")).resolves.toEqual({
+      repos: 1,
+      items: 2,
+    });
+
+    expect(await bb.storage.kv.get("sync-cursor")).toMatchObject({
+      repos: 1,
+      items: 2,
+    });
+    expect(
+      harness.logEntries.filter(
+        (entry) => entry.message.includes("Dependabot sync failed"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.logEntries.filter((entry) =>
+        entry.message.includes("sync failed (retry"),
+      ),
+    ).toEqual([]);
+    expect(
+      harness.realtimeSignals.filter(
+        (signal) => signal.channel === "data-changed",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("settles the background service without retrying known Dependabot limits", async () => {
+    const { harness } = await loadPlugin();
+    writeFileSync(dependabotDisabledFlag, "");
+    const { controller, done } = harness.runService("sync");
+
+    await vi.waitFor(
+      () => {
+        expect(harness.logEntries).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              level: "info",
+              message: "synced 2 item(s) across 1 repo(s)",
+            }),
+          ]),
+        );
+      },
+      { timeout: 4_000 },
+    );
+    controller.abort();
+    await done;
+
+    expect(
+      harness.logEntries.filter((entry) =>
+        entry.message.includes("sync failed (retry"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("reuses one repository discovery snapshot for a full sync", async () => {
+    let projectListCalls = 0;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "github",
+      settings: { extraRepos: "acme/widgets other/repo" },
+      sdk: {
+        projects: {
+          list: () => {
+            projectListCalls += 1;
+            return [];
+          },
+        },
+      },
+    });
+    await plugin(bb);
+
+    await expect(harness.callRpc("refresh")).resolves.toEqual({
+      repos: 2,
+      items: 2,
+    });
+    expect(projectListCalls).toBe(2);
   });
 
   it("syncs, filters, mutates, and exposes the same cached issue across surfaces", async () => {
