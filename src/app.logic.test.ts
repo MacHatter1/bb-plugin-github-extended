@@ -6,7 +6,11 @@ import {
   normalizeStatus,
   parseQuery,
   parseSubPath,
+  repoHealthColorCounts,
+  repoHealthDotClass,
   routeToSubPath,
+  summarizeRepoHealth,
+  worstRepoHealth,
   type Item,
   type Route,
 } from "./app-logic.js";
@@ -73,7 +77,32 @@ describe("github status normalization", () => {
         },
       ],
       lastSyncedAt: "2026-08-29T12:00:00Z",
+      syncing: false,
     });
+  });
+
+  it("uses the worst repository health for the summary indicator", () => {
+    expect(worstRepoHealth([])).toBeNull();
+    expect(worstRepoHealth(["healthy", "healthy"])).toBe("healthy");
+    expect(worstRepoHealth(["healthy", "never"])).toBe("never");
+    expect(worstRepoHealth(["healthy", "partial"])).toBe("partial");
+    expect(worstRepoHealth(["healthy", "partial", "failed"])).toBe("failed");
+    expect(worstRepoHealth(["syncing", "partial"])).toBe("syncing");
+    expect(repoHealthDotClass("healthy")).toBe("bg-green-500");
+    expect(repoHealthDotClass("partial")).toBe("bg-muted-foreground/50");
+    expect(repoHealthDotClass("never")).toBe("bg-muted-foreground/50");
+    expect(repoHealthDotClass("failed")).toBe("bg-red-500");
+    expect(summarizeRepoHealth(["healthy", "healthy", "partial"])).toBe(
+      "2 healthy, 1 partial",
+    );
+    expect(summarizeRepoHealth(["failed", "never"])).toBe("1 failed, 1 not synced");
+    expect(
+      repoHealthColorCounts(["healthy", "healthy", "partial", "never", "failed"]),
+    ).toEqual([
+      { tone: "healthy", count: 2 },
+      { tone: "muted", count: 2 },
+      { tone: "failed", count: 1 },
+    ]);
   });
 
   it("normalizes missing status payloads to an unavailable UI state", () => {
@@ -84,6 +113,7 @@ describe("github status normalization", () => {
       ghError: null,
       repos: [],
       lastSyncedAt: null,
+      syncing: false,
     });
   });
 });

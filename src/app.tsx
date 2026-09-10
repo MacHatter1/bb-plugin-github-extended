@@ -10,12 +10,15 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import {
   buildSuggestions,
-  matchesQuery,
   isSafeExternalUrl,
+  matchesQuery,
   normalizeStatus,
   parseQuery,
   parseSubPath,
+  repoHealthColorCounts,
+  repoHealthDotClass,
   routeToSubPath,
+  summarizeRepoHealth,
   type GithubStatus,
   type Item,
   type RepoHealth,
@@ -49,7 +52,7 @@ import "./ui-fixes.css";
 import { toast } from "sonner";
 import { Badge } from "./shared-ui.js";
 import { Button } from "./shared-ui.js";
-import { DelayedLoading } from "./shared-ui.js";
+import { cn } from "./shared-ui.js";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -60,6 +63,8 @@ import {
   DropdownMenuTrigger,
 } from "./shared-ui.js";
 import { Input } from "./shared-ui.js";
+import { MenuLoading } from "./shared-ui.js";
+import { RefreshBar } from "./shared-ui.js";
 import {
   Select,
   SelectContent,
@@ -68,6 +73,7 @@ import {
   SelectValue,
 } from "./shared-ui.js";
 import { Skeleton } from "./shared-ui.js";
+import { Spinner } from "./shared-ui.js";
 import { Tabs, TabsList, TabsPanel, TabsTrigger } from "./shared-ui.js";
 import { Textarea } from "./shared-ui.js";
 import { EmptyState } from "@/components/empty-state";
@@ -183,6 +189,7 @@ function useSubPathRoute(subPath: string): [Route, (route: Route) => void] {
 function useItems(kind: "issue" | "pr"): {
   items: Item[] | null;
   error: string | null;
+  loading: boolean;
   refetch: () => void;
 } {
   const rpc = useRpc<typeof githubRpcContract>();
@@ -192,27 +199,45 @@ function useItems(kind: "issue" | "pr"): {
   const [state, setState] = useState<{
     items: Item[] | null;
     error: string | null;
+    loading: boolean;
+    kind: "issue" | "pr";
   }>({
     items: null,
     error: null,
+    loading: true,
+    kind,
   });
   const refetch = useCallback(() => {
     const requestId = ++requestRef.current;
     const requestKind = kind;
+    setState((previous) => ({
+      items: previous.kind === requestKind ? previous.items : null,
+      error: previous.kind === requestKind ? previous.error : null,
+      loading: true,
+      kind: requestKind,
+    }));
     rpc.call("listItems", { kind }).then(
       (result) => {
         if (requestId !== requestRef.current || requestKind !== activeKind.current) return;
-        setState({ items: asItems(result), error: null });
+        setState({
+          items: asItems(result),
+          error: null,
+          loading: false,
+          kind: requestKind,
+        });
       },
       (error: unknown) => {
         if (requestId !== requestRef.current || requestKind !== activeKind.current) return;
-        setState({ items: null, error: errorText(error) });
+        setState((previous) => ({
+          items: previous.kind === requestKind ? previous.items : null,
+          error: errorText(error),
+          loading: false,
+          kind: requestKind,
+        }));
       },
     );
   }, [rpc, kind]);
   useEffect(() => {
-    requestRef.current += 1;
-    setState({ items: null, error: null });
     refetch();
     return () => {
       requestRef.current += 1;
@@ -381,6 +406,26 @@ function ChevronDownIcon() {
       className="shrink-0 opacity-50"
     >
       <path d="m6 9 6 6 6-6" />
+    </svg>
+  );
+}
+
+function SearchIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3-3" />
     </svg>
   );
 }
@@ -596,7 +641,7 @@ function FilterBar({
 
   return (
     <div className="relative">
-      {}
+      <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
       <input
         ref={inputRef}
         value={value}
@@ -620,7 +665,7 @@ function FilterBar({
             : undefined
         }
         placeholder={placeholder ?? "Filter — is:open assignee:@me label:bug, or plain text"}
-        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 pr-8 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        className="flex h-9 w-full rounded-lg border border-input bg-transparent py-1 pl-9 pr-8 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         spellCheck={false}
         autoComplete="off"
       />
@@ -737,7 +782,10 @@ function StatusCell({ item }: { item: Item }) {
           aria-busy={pending}
         >
           <StateDot kind="issue" state={item.state} />
-          <span>{pending ? "…" : item.state.toLowerCase()}</span>
+          <span className="inline-flex items-center gap-1">
+            {pending ? <Spinner className="size-3" /> : null}
+            {item.state.toLowerCase()}
+          </span>
           <ChevronDownIcon />
         </Button>
       </DropdownMenuTrigger>
@@ -847,32 +895,37 @@ function ItemRow({
   const busy = spawningKey === `${item.repo}#${item.number}`;
   return (
     <div
-      className="grid grid-cols-1 gap-y-2 px-3 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2"
+      className="grid grid-cols-1 gap-y-2 px-3 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2.5"
     >
-      <span className="flex min-w-0 flex-col items-start gap-1.5 @[48rem]:order-2 @[48rem]:flex-1 @[48rem]:flex-row @[48rem]:items-center @[48rem]:gap-2">
-        <button
-          type="button"
-          className="min-w-0 flex-1 bg-transparent p-0 text-left"
-          aria-label={`View ${item.kind === "pr" ? "pull request" : "issue"} #${item.number} in ${item.repo}`}
-          onClick={onOpen}
-        >
-          <span
-            className="block line-clamp-3 text-sm font-medium leading-snug text-foreground @[48rem]:line-clamp-1 @[48rem]:leading-normal"
-            title={item.title}
+      <span className="flex min-w-0 items-start gap-2.5 @[48rem]:order-2 @[48rem]:flex-1 @[48rem]:items-center">
+        {item.author.length > 0 ? (
+          <Avatar login={item.author} className="mt-0.5 @[48rem]:mt-0" />
+        ) : null}
+        <span className="flex min-w-0 flex-1 flex-col items-start gap-1.5 @[48rem]:flex-row @[48rem]:items-center @[48rem]:gap-2">
+          <button
+            type="button"
+            className="min-w-0 flex-1 bg-transparent p-0 text-left"
+            aria-label={`View ${item.kind === "pr" ? "pull request" : "issue"} #${item.number} in ${item.repo}`}
+            onClick={onOpen}
           >
-            {item.title}
-          </span>
-          <span className="mt-0.5 block truncate text-xs font-normal text-muted-foreground">
-            {item.kind === "pr"
-              ? `by ${item.author || "unknown"} · ${item.repo}`
-              : `${item.repo}${item.author.length > 0 ? ` · by ${item.author}` : ""}`}
-          </span>
-        </button>
-        <LabelChips
-          labels={item.labels}
-          className="hidden shrink-0 @[60rem]:flex"
-        />
-        <ThreadPills links={links} />
+            <span
+              className="block line-clamp-3 text-sm font-medium leading-snug text-foreground @[48rem]:line-clamp-1 @[48rem]:leading-normal"
+              title={item.title}
+            >
+              {item.title}
+            </span>
+            <span className="mt-0.5 block truncate text-xs font-normal text-muted-foreground">
+              {item.kind === "pr"
+                ? `by ${item.author || "unknown"} · ${item.repo}`
+                : `${item.repo}${item.author.length > 0 ? ` · by ${item.author}` : ""}`}
+            </span>
+          </button>
+          <LabelChips
+            labels={item.labels}
+            className="hidden shrink-0 @[60rem]:flex"
+          />
+          <ThreadPills links={links} />
+        </span>
       </span>
       <span className="flex min-w-0 items-center gap-2 @[48rem]:contents">
         <span
@@ -897,8 +950,9 @@ function ItemRow({
           <Button
             size="sm"
             variant="outline"
-            className="h-7"
+            className="h-7 gap-1.5"
             disabled={spawningKey !== null}
+            aria-busy={busy}
             onClick={(event) => {
               event.stopPropagation();
               spawn(
@@ -908,7 +962,8 @@ function ItemRow({
               );
             }}
           >
-            {busy ? "…" : item.kind === "issue" ? "Start" : "Review"}
+            {busy ? <Spinner className="size-3" /> : null}
+            {item.kind === "issue" ? "Start" : "Review"}
           </Button>
           <RowMenu item={item} />
         </span>
@@ -917,49 +972,132 @@ function ItemRow({
   );
 }
 
-function TableSkeleton() {
+function TableSkeleton({
+  label,
+  rows = 6,
+}: {
+  label: string;
+  rows?: number;
+}) {
   return (
-    <DelayedLoading>
+    <div role="status" aria-live="polite" aria-busy="true" aria-label={label}>
+      <span className="sr-only">{label}</span>
       <div className="divide-y divide-border">
-        {[0, 1, 2, 3].map((row) => (
+        {Array.from({ length: rows }, (_, row) => (
           <div
             key={row}
             className="grid grid-cols-1 gap-y-3 px-3 py-3 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3"
           >
-            <Skeleton className="h-3 w-4/5 @[48rem]:order-2 @[48rem]:flex-1" />
+            <div className="flex min-w-0 flex-col gap-2 @[48rem]:order-2 @[48rem]:flex-1">
+              <Skeleton className="h-3 w-4/5" />
+              <Skeleton className="h-3 w-1/3" />
+            </div>
             <span className="flex items-center gap-2 @[48rem]:contents">
               <span className={`${COL.id} @[48rem]:order-1`}>
                 <Skeleton className="h-3 w-10" />
               </span>
               <span className={`${COL.assignee} flex @[48rem]:order-3`}>
-                <Skeleton className="size-5 rounded-full @[48rem]:h-3 @[48rem]:w-16" />
+                <Skeleton className="size-5 rounded-full" />
               </span>
               <span className={`${COL.status} @[48rem]:order-4`}>
-                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-5 w-16 rounded-full" />
               </span>
               <span className={`${COL.updated} @[48rem]:order-5`}>
                 <Skeleton className="ml-auto h-3 w-12" />
               </span>
               <span className={`${COL.actions} @[48rem]:order-6`}>
-                <Skeleton className="h-7 w-20" />
+                <Skeleton className="h-7 w-16" />
               </span>
             </span>
           </div>
         ))}
       </div>
-    </DelayedLoading>
+    </div>
   );
 }
 
-function DetailSkeleton() {
+function DetailSkeleton({
+  label = "Loading details",
+  compact = false,
+}: {
+  label?: string;
+  compact?: boolean;
+}) {
   return (
-    <DelayedLoading>
-      <div className="flex flex-col gap-4">
-        <Skeleton className="h-4 w-40" />
-        <Skeleton className="h-7 w-2/3" />
-        <Skeleton className="h-32 w-full" />
+    <div
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-label={label}
+      className="flex flex-col gap-4"
+    >
+      <span className="sr-only">{label}</span>
+      <Skeleton className="h-4 w-40" />
+      <div className="flex items-start gap-3">
+        <Skeleton className={`h-7 ${compact ? "w-1/2" : "w-2/3"}`} />
+        <Skeleton className="h-8 w-24 shrink-0" />
       </div>
-    </DelayedLoading>
+      {compact ? (
+        <Skeleton className="h-28 w-full" />
+      ) : (
+        <div className="flex flex-col gap-6 lg:flex-row">
+          <div className="flex min-w-0 flex-1 flex-col gap-3">
+            <div className="overflow-hidden rounded-lg border border-border">
+              <Skeleton className="h-9 w-full rounded-none" />
+              <div className="flex flex-col gap-2 p-4">
+                <Skeleton className="h-3 w-full" />
+                <Skeleton className="h-3 w-5/6" />
+                <Skeleton className="h-3 w-2/3" />
+              </div>
+            </div>
+            <Skeleton className="h-24 w-full" />
+          </div>
+          <aside className="flex w-full shrink-0 flex-col gap-3 lg:w-56">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+          </aside>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RepositoryManagerSkeleton() {
+  return (
+    <section
+      className="overflow-hidden rounded-lg border border-border bg-card"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-label="Loading repositories"
+    >
+      <span className="sr-only">Loading repositories</span>
+      <div className="flex items-start justify-between gap-3 border-b border-border bg-muted/50 px-4 py-3">
+        <div className="min-w-0 flex-1">
+          <Skeleton className="h-4 w-44" />
+          <Skeleton className="mt-2 h-3 w-64" />
+        </div>
+        <Skeleton className="h-5 w-8 rounded-full" />
+      </div>
+      {[0, 1].map((row) => (
+        <div
+          key={row}
+          className="flex flex-col gap-3 border-t border-border px-4 py-3 @[48rem]:flex-row @[48rem]:items-center"
+        >
+          <div className="min-w-0 flex-1">
+            <Skeleton className="h-4 w-48" />
+            <Skeleton className="mt-2 h-3 w-32" />
+          </div>
+          <div className="flex gap-2">
+            <Skeleton className="h-10 w-16" />
+            <Skeleton className="h-10 w-16" />
+            <Skeleton className="h-10 w-16" />
+          </div>
+          <Skeleton className="h-8 w-20" />
+        </div>
+      ))}
+    </section>
   );
 }
 
@@ -967,8 +1105,10 @@ function ItemsTable({
   kind,
   items,
   error,
+  loading,
   hasFilter,
   onRetry,
+  onClearFilter,
   onOpenItem,
   page,
   pageCount,
@@ -980,8 +1120,10 @@ function ItemsTable({
   kind: "issue" | "pr";
   items: Item[] | null;
   error: string | null;
+  loading: boolean;
   hasFilter: boolean;
   onRetry: () => void;
+  onClearFilter?: () => void;
   onOpenItem: (repo: string, number: number) => void;
   page: number;
   pageCount: number;
@@ -991,20 +1133,34 @@ function ItemsTable({
   onPageChange: (page: number) => void;
 }) {
   const { links, error: linksError, refetch: retryLinks } = useLinks();
+  const noun = kind === "issue" ? "issues" : "pull requests";
 
   let body: React.ReactNode;
-  if (error !== null) {
-    body = <EmptyState message={error} onRetry={onRetry} />;
+  if (error !== null && items === null) {
+    body = (
+      <EmptyState
+        title={`Couldn't load ${noun}`}
+        message={error}
+        onRetry={onRetry}
+      />
+    );
   } else if (items === null) {
-    body = <TableSkeleton />;
+    body = (
+      <TableSkeleton
+        label={kind === "issue" ? "Loading issues" : "Loading pull requests"}
+      />
+    );
   } else if (items.length === 0) {
     body = (
       <EmptyState
+        title={hasFilter ? "No matches" : `No ${noun}`}
         message={
           hasFilter
-            ? `No ${kind === "issue" ? "issues" : "pull requests"} match this filter.`
-            : `No ${kind === "issue" ? "issues" : "pull requests"} in the tracked repos.`
+            ? `No ${noun} match this filter.`
+            : `No ${noun} in the tracked repos.`
         }
+        actionLabel={hasFilter ? "Clear filter" : undefined}
+        onAction={hasFilter ? onClearFilter : undefined}
       />
     );
   } else {
@@ -1023,7 +1179,10 @@ function ItemsTable({
   }
 
   return (
-    <div className="@container overflow-hidden rounded-lg border border-border bg-card">
+    <div
+      className="@container overflow-hidden rounded-lg border border-border bg-card"
+      aria-busy={loading}
+    >
       <div className="hidden items-center gap-3 border-b border-border bg-muted/50 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground @[48rem]:flex">
         <span className={COL.id}>ID</span>
         <span className="min-w-0 flex-1">Title</span>
@@ -1032,6 +1191,23 @@ function ItemsTable({
         <span className={COL.updated}>Updated</span>
         <span className={COL.actions} />
       </div>
+      {loading && items !== null ? (
+        <>
+          <span className="sr-only">Updating {noun}</span>
+          <RefreshBar visible />
+        </>
+      ) : null}
+      {error !== null && items !== null ? (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-xs text-red-600 dark:text-red-400"
+        >
+          <span>Could not refresh {noun}: {error}</span>
+          <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
       <LinkErrorNotice error={linksError} onRetry={retryLinks} />
       {body}
       {showPagination && items !== null && total > 0 ? (
@@ -1167,7 +1343,7 @@ function AssigneePicker({
         {loadError !== null ? (
           <DropdownMenuItem onSelect={load}>{loadError} — Retry</DropdownMenuItem>
         ) : ordered === null ? (
-          <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
+          <MenuLoading label="Loading assignees" />
         ) : ordered.length === 0 ? (
           <DropdownMenuItem disabled>No assignable users</DropdownMenuItem>
         ) : (
@@ -1254,7 +1430,7 @@ function LabelPicker({
         {loadError !== null ? (
           <DropdownMenuItem onSelect={load}>{loadError} — Retry</DropdownMenuItem>
         ) : ordered === null ? (
-          <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
+          <MenuLoading label="Loading labels" />
         ) : ordered.length === 0 ? (
           <DropdownMenuItem disabled>No labels in repo</DropdownMenuItem>
         ) : (
@@ -1289,6 +1465,7 @@ function IssueDetailView({
   const { setIssueState, setAssignees, setLabels } = useIssueMutations();
   const [detail, setDetail] = useState<IssueDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [comment, setComment] = useState("");
   const [posting, setPosting] = useState(false);
   const detailKey = `${repo}#${number}`;
@@ -1307,6 +1484,7 @@ function IssueDetailView({
   const load = useCallback(() => {
     const requestId = ++loadRequest.current;
     const requestKey = detailKey;
+    setLoading(true);
     rpc.call("getIssue", { repo, number }).then(
       (result) => {
         if (requestId !== loadRequest.current || activeDetailKey.current !== requestKey) return;
@@ -1315,15 +1493,18 @@ function IssueDetailView({
           detailRef.current = null;
           setDetail(null);
           setError("malformed getIssue result");
+          setLoading(false);
           return;
         }
         detailRef.current = issue;
         setDetail(issue);
         setError(null);
+        setLoading(false);
       },
       (err: unknown) => {
         if (requestId === loadRequest.current && activeDetailKey.current === requestKey) {
           setError(errorText(err));
+          setLoading(false);
         }
       },
     );
@@ -1332,6 +1513,7 @@ function IssueDetailView({
     detailRef.current = null;
     setDetail(null);
     setError(null);
+    setLoading(true);
     stateMutationVersion.current += 1;
     setStatePending(false);
     load();
@@ -1467,14 +1649,34 @@ function IssueDetailView({
       .finally(() => setPosting(false));
   }, [rpc, repo, number, comment, load]);
 
-  if (error !== null) return <EmptyState message={error} onRetry={load} />;
+  if (detail === null && error !== null) {
+    return (
+      <EmptyState
+        title="Couldn't load issue"
+        message={error}
+        onRetry={load}
+      />
+    );
+  }
   if (detail === null) {
-    return <DetailSkeleton />;
+    return <DetailSkeleton label="Loading issue" />;
   }
 
   const issueLinks = links[`issue:${repo}#${number}`];
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4" aria-busy={loading || posting || statePending}>
+      {loading ? <RefreshBar visible /> : null}
+      {error !== null ? (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-xs text-red-600 dark:text-red-400"
+        >
+          <span>Could not refresh this issue: {error}</span>
+          <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={load}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
       <LinkErrorNotice error={linksError} onRetry={retryLinks} />
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
@@ -1498,9 +1700,12 @@ function IssueDetailView({
         </h2>
         <Button
           size="sm"
+          className="gap-1.5"
           disabled={spawningKey !== null}
+          aria-busy={spawningKey !== null}
           onClick={() => spawn("startWork", repo, number)}
         >
+          {spawningKey !== null ? <Spinner className="size-3" /> : null}
           {spawningKey !== null ? "Starting…" : "Send agent"}
         </Button>
       </div>
@@ -1559,9 +1764,12 @@ function IssueDetailView({
             <div className="flex justify-end">
               <Button
                 size="sm"
+                className="gap-1.5"
                 disabled={posting || comment.trim().length === 0}
+                aria-busy={posting}
                 onClick={postComment}
               >
+                {posting ? <Spinner className="size-3" /> : null}
                 {posting ? "Posting…" : "Comment"}
               </Button>
             </div>
@@ -1583,7 +1791,10 @@ function IssueDetailView({
                 disabled={statePending}
                 className="h-8 w-full text-sm"
               >
-                <SelectValue />
+                <span className="inline-flex min-w-0 items-center gap-1.5">
+                  {statePending ? <Spinner className="size-3" /> : null}
+                  <SelectValue />
+                </span>
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="open">
@@ -2039,9 +2250,12 @@ function PullCommentBox({
       <div className="flex justify-end">
         <Button
           size="sm"
+          className="gap-1.5"
           disabled={posting || comment.trim().length === 0}
+          aria-busy={posting}
           onClick={post}
         >
+          {posting ? <Spinner className="size-3" /> : null}
           {posting ? "Posting…" : "Comment"}
         </Button>
       </div>
@@ -2067,6 +2281,7 @@ function PullDetailView({
   const { spawn, spawningKey } = useSpawn();
   const [pull, setPull] = useState<PullDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const detailKey = `${repo}#${number}`;
   const activeDetailKey = useRef(detailKey);
   activeDetailKey.current = detailKey;
@@ -2075,6 +2290,7 @@ function PullDetailView({
   const load = useCallback(() => {
     const requestId = ++loadRequest.current;
     const requestKey = detailKey;
+    setLoading(true);
     rpc.call("getPull", { repo, number }).then(
       (result) => {
         if (requestId !== loadRequest.current || activeDetailKey.current !== requestKey) return;
@@ -2082,14 +2298,17 @@ function PullDetailView({
         if (detail === undefined || detail === null) {
           setPull(null);
           setError("malformed getPull result");
+          setLoading(false);
           return;
         }
         setPull(detail);
         setError(null);
+        setLoading(false);
       },
       (err: unknown) => {
         if (requestId === loadRequest.current && activeDetailKey.current === requestKey) {
           setError(errorText(err));
+          setLoading(false);
         }
       },
     );
@@ -2097,12 +2316,24 @@ function PullDetailView({
   useEffect(() => {
     setPull(null);
     setError(null);
+    setLoading(true);
     load();
+    return () => {
+      loadRequest.current += 1;
+    };
   }, [load]);
 
-  if (error !== null) return <EmptyState message={error} onRetry={load} />;
+  if (pull === null && error !== null) {
+    return (
+      <EmptyState
+        title="Couldn't load pull request"
+        message={error}
+        onRetry={load}
+      />
+    );
+  }
   if (pull === null) {
-    return <DetailSkeleton />;
+    return <DetailSkeleton label="Loading pull request" compact={compact} />;
   }
 
   const pullLinks = links[`pr:${repo}#${number}`];
@@ -2139,7 +2370,19 @@ function PullDetailView({
   );
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4" aria-busy={loading}>
+      {loading ? <RefreshBar visible /> : null}
+      {error !== null ? (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-xs text-red-600 dark:text-red-400"
+        >
+          <span>Could not refresh this pull request: {error}</span>
+          <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={load}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
       <LinkErrorNotice error={linksError} onRetry={retryLinks} />
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         {onBack !== undefined ? (
@@ -2175,9 +2418,12 @@ function PullDetailView({
         </h2>
         <Button
           size="sm"
+          className="gap-1.5"
           disabled={spawningKey !== null}
+          aria-busy={spawningKey !== null}
           onClick={() => spawn("startReview", repo, number)}
         >
+          {spawningKey !== null ? <Spinner className="size-3" /> : null}
           {spawningKey !== null ? "Starting…" : "Review with agent"}
         </Button>
       </div>
@@ -2255,25 +2501,49 @@ function PullPickerList({
   onPick: (repo: string, number: number) => void;
   disabled?: boolean;
 }) {
-  const { items, error, refetch } = useItems("pr");
-  if (error !== null) return <EmptyState message={error} onRetry={refetch} />;
+  const { items, error, loading, refetch } = useItems("pr");
+  if (error !== null && items === null) {
+    return (
+      <EmptyState
+        title="Couldn't load pull requests"
+        message={error}
+        onRetry={refetch}
+      />
+    );
+  }
   if (items === null) {
     return (
-      <DelayedLoading>
-        <div className="flex flex-col gap-2">
-          <Skeleton className="h-5 w-full" />
-          <Skeleton className="h-5 w-5/6" />
-          <Skeleton className="h-5 w-2/3" />
-        </div>
-      </DelayedLoading>
+      <div
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+        aria-label="Loading pull requests"
+        className="flex flex-col gap-2"
+      >
+        <span className="sr-only">Loading pull requests</span>
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-9 w-5/6" />
+        <Skeleton className="h-9 w-2/3" />
+      </div>
     );
   }
   const open = items.filter((item) => item.state === "OPEN");
   if (open.length === 0) {
-    return <EmptyState message="No open pull requests in the tracked repos." />;
+    return (
+      <EmptyState
+        title="No open pull requests"
+        message="No open pull requests in the tracked repos."
+      />
+    );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
+    <div className="overflow-hidden rounded-lg border border-border bg-card" aria-busy={loading}>
+      {loading ? (
+        <>
+          <span className="sr-only">Updating pull requests</span>
+          <RefreshBar visible />
+        </>
+      ) : null}
       <div className="divide-y divide-border">
         {open.map((item) => (
           <button
@@ -2401,7 +2671,7 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
   );
 
   if (!resolved) {
-    return <DetailSkeleton />;
+    return <DetailSkeleton label="Loading linked pull request" compact />;
   }
   if (selected === null) {
     return (
@@ -2423,7 +2693,8 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
           </p>
         ) : null}
         {linking ? (
-          <p role="status" className="text-xs text-muted-foreground">
+          <p role="status" className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Spinner className="size-3" />
             Linking pull request…
           </p>
         ) : null}
@@ -2564,7 +2835,8 @@ function NewIssueForm({
           </div>
           <div className="ml-auto flex items-center gap-2">
             <Button type="button" size="sm" variant="ghost" onClick={onCancel} disabled={creating}>Cancel</Button>
-            <Button type="submit" size="sm" disabled={creating || title.trim().length === 0 || repo.length === 0} aria-busy={creating}>
+            <Button type="submit" size="sm" className="gap-1.5" disabled={creating || title.trim().length === 0 || repo.length === 0} aria-busy={creating}>
+              {creating ? <Spinner className="size-3" /> : null}
               {creating ? "Creating…" : "Create issue"}
             </Button>
           </div>
@@ -2579,14 +2851,17 @@ type Status = GithubStatus;
 function useStatus(): {
   status: Status | null;
   error: string | null;
+  loading: boolean;
   refetch: () => void;
 } {
   const rpc = useRpc<typeof githubRpcContract>();
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const requestVersion = useRef(0);
   const refetch = useCallback(() => {
     const version = ++requestVersion.current;
+    setLoading(true);
     setError(null);
     rpc.call("status").then(
       (result) => {
@@ -2595,54 +2870,65 @@ function useStatus(): {
         if (next === null) {
           setStatus(null);
           setError("GitHub status response was invalid.");
+          setLoading(false);
           return;
         }
         setStatus(next);
         setError(null);
+        setLoading(false);
       },
       (reason: unknown) => {
         if (version !== requestVersion.current) return;
-        setStatus(null);
         setError(errorText(reason));
+        setLoading(false);
       },
     );
   }, [rpc]);
   useEffect(() => {
     refetch();
+    return () => {
+      requestVersion.current += 1;
+    };
   }, [refetch]);
   useRealtime("data-changed", refetch);
-  return { status, error, refetch };
+  return { status, error, loading, refetch };
 }
 
 function PanelHeader() {
   const rpc = useRpc<typeof githubRpcContract>();
-  const { status, error: statusError, refetch } = useStatus();
+  const { status, error: statusError, loading } = useStatus();
   const [syncing, setSyncing] = useState(false);
   const [failed, setFailed] = useState(false);
   const refresh = useCallback(() => {
-    refetch();
     setSyncing(true);
     setFailed(false);
     rpc
       .call("refresh")
       .catch(() => setFailed(true))
       .finally(() => setSyncing(false));
-  }, [rpc, refetch]);
+  }, [rpc]);
+  const busy = syncing || (loading && status === null);
   return (
     <>
-      <span className="hidden text-xs text-muted-foreground sm:inline">
+      <span className="hidden items-center gap-1.5 text-xs text-muted-foreground sm:inline-flex">
         {failed ? (
           "Sync failed — check `gh auth status`"
-        ) : statusError !== null ? (
+        ) : status === null && statusError !== null ? (
           "GitHub status unavailable — retry"
         ) : status === null ? (
-          <DelayedLoading>Loading…</DelayedLoading>
+          <>
+            <Spinner className="size-3" />
+            Checking GitHub…
+          </>
         ) : status.ghOk ? (
-          `${status.repos.length} repo${status.repos.length === 1 ? "" : "s"} · synced ${
-            status.lastSyncedAt !== null
-              ? relativeTime(status.lastSyncedAt)
-              : "never"
-          }`
+          <>
+            {syncing ? <Spinner className="size-3" /> : null}
+            {`${status.repos.length} repo${status.repos.length === 1 ? "" : "s"} · synced ${
+              status.lastSyncedAt !== null
+                ? relativeTime(status.lastSyncedAt)
+                : "never"
+            }`}
+          </>
         ) : status.ghState === "unavailable" ? (
           "GitHub CLI unavailable — retrying"
         ) : (
@@ -2654,6 +2940,7 @@ function PanelHeader() {
         variant="outline"
         className="size-8 gap-1.5 px-0 sm:h-8 sm:w-auto sm:px-3"
         disabled={syncing}
+        aria-busy={busy}
         onClick={refresh}
         aria-label={syncing ? "Syncing GitHub data" : statusError !== null ? "Retry GitHub status" : "Refresh GitHub data"}
       >
@@ -2676,7 +2963,7 @@ function tabForRoute(route: Route): SavedViewTab {
 
 function GithubPanel({ subPath }: PluginNavPanelProps) {
   const [route, navigate] = useSubPathRoute(subPath);
-  const { status, error: statusError, refetch: retryStatus } = useStatus();
+  const { status, error: statusError, loading: statusLoading, refetch: retryStatus } = useStatus();
   const [queries, setQueries] = useState<QueryState>(() =>
     loadQueryState(window.localStorage),
   );
@@ -2706,9 +2993,12 @@ function GithubPanel({ subPath }: PluginNavPanelProps) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
       <div className="mx-auto w-full max-w-5xl space-y-4">
-        {statusError !== null ? (
+        {statusError !== null && status === null ? (
           <div role="alert" className="rounded-lg border border-border bg-card">
-            <EmptyState message={`Could not load GitHub status: ${statusError}`} />
+            <EmptyState
+              title="Couldn't load GitHub status"
+              message={`Could not load GitHub status: ${statusError}`}
+            />
             <div className="flex justify-center border-t border-border px-6 py-3">
               <Button size="sm" variant="outline" onClick={retryStatus}>
                 Retry GitHub status
@@ -2716,14 +3006,28 @@ function GithubPanel({ subPath }: PluginNavPanelProps) {
             </div>
           </div>
         ) : (
-          <GithubPanelBody
-            route={route}
-            navigate={navigate}
-            status={status}
-            query={queries[tab]}
-            setQuery={setQuery}
-            onRetryStatus={retryStatus}
-          />
+          <>
+            {statusError !== null ? (
+              <div
+                role="alert"
+                className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2 text-xs text-red-600 dark:text-red-400"
+              >
+                <span>Could not refresh GitHub status: {statusError}</span>
+                <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={retryStatus}>
+                  Retry GitHub status
+                </Button>
+              </div>
+            ) : null}
+            <GithubPanelBody
+              route={route}
+              navigate={navigate}
+              status={status}
+              loading={statusLoading}
+              query={queries[tab]}
+              setQuery={setQuery}
+              onRetryStatus={retryStatus}
+            />
+          </>
         )}
       </div>
     </div>
@@ -2747,11 +3051,13 @@ function SavedViewsBar({
     }
   });
   const [name, setName] = useState("");
-  const [selected, setSelected] = useState("");
+  const [editing, setEditing] = useState(false);
   const current = views[tab];
+  const selected = current.find((view) => view.query === query)?.name ?? "";
 
   useEffect(() => {
-    setSelected("");
+    setEditing(false);
+    setName("");
   }, [tab]);
 
   useEffect(() => {
@@ -2769,59 +3075,91 @@ function SavedViewsBar({
     saveSavedViews(window.localStorage, next);
   };
 
+  if (current.length === 0 && query.trim().length === 0 && !editing) {
+    return null;
+  }
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <select
-        value={selected}
-        onChange={(event) => {
-          const next = current.find((view) => view.name === event.target.value);
-          setSelected(event.target.value);
-          if (next !== undefined) onChange(next.query);
-        }}
-        className="h-8 rounded-md border border-input bg-transparent px-2 text-xs text-foreground"
-        aria-label="Saved views"
-      >
-        <option value="">Saved views</option>
-        {current.map((view) => (
-          <option key={view.name} value={view.name}>
-            {view.name}
-          </option>
-        ))}
-      </select>
-      <input
-        value={name}
-        onChange={(event) => setName(event.target.value)}
-        placeholder="Name this view"
-        className="h-8 w-40 rounded-md border border-input bg-transparent px-2 text-xs"
-        aria-label="Saved view name"
-      />
-      <Button
-        size="sm"
-        variant="outline"
-        className="h-8"
-        disabled={name.trim().length === 0}
-        onClick={() => {
-          const next = upsertSavedView(views, tab, name, query);
-          persist(next);
-          setSelected(name.trim());
-          setName("");
-        }}
-      >
-        Save view
-      </Button>
-      {selected !== "" ? (
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Saved views">
+      {current.map((view) => {
+        const active = view.name === selected;
+        return (
+          <span
+            key={view.name}
+            className={cn(
+              "inline-flex h-7 max-w-full items-center rounded-full border text-xs transition-colors",
+              active
+                ? "border-foreground bg-foreground text-background"
+                : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+            )}
+          >
+            <button
+              type="button"
+              aria-pressed={active}
+              className="inline-flex min-w-0 items-center truncate rounded-full px-2.5 py-0"
+              onClick={() => onChange(active ? "" : view.query)}
+            >
+              {view.name}
+            </button>
+            {active ? (
+              <button
+                type="button"
+                className="mr-1 inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[11px] opacity-80 hover:bg-background/20 hover:opacity-100"
+                aria-label={`Delete ${view.name}`}
+                onClick={() => persist(deleteSavedView(views, tab, view.name))}
+              >
+                ×
+              </button>
+            ) : null}
+          </span>
+        );
+      })}
+      {editing ? (
+        <form
+          className="flex items-center gap-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (name.trim().length === 0) return;
+            persist(upsertSavedView(views, tab, name, query));
+            setName("");
+            setEditing(false);
+          }}
+        >
+          <Input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="View name"
+            aria-label="Saved view name"
+            className="h-7 w-36 text-xs"
+            autoFocus
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7" disabled={name.trim().length === 0}>
+            Save
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7"
+            onClick={() => {
+              setEditing(false);
+              setName("");
+            }}
+          >
+            Cancel
+          </Button>
+        </form>
+      ) : (
         <Button
           size="sm"
           variant="ghost"
-          className="h-8 text-xs text-muted-foreground"
-          onClick={() => {
-            persist(deleteSavedView(views, tab, selected));
-            setSelected("");
-          }}
+          className="h-7 text-xs text-muted-foreground"
+          disabled={query.trim().length === 0 || selected !== ""}
+          onClick={() => setEditing(true)}
         >
-          Delete
+          Save view
         </Button>
-      ) : null}
+      )}
     </div>
   );
 }
@@ -2857,35 +3195,27 @@ function AddRepositoryForm() {
     [rpc, value, adding],
   );
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex items-center gap-3 border-b border-border bg-muted/50 px-4 py-3">
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-background text-lg text-muted-foreground" aria-hidden="true">+</span>
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground">Track a repository</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">Add an accessible GitHub repository to your workspace.</p>
-        </div>
-      </div>
-      <form
-        className="@container flex flex-col gap-2 p-4 @[48rem]:flex-row @[48rem]:items-end"
-        onSubmit={submit}
-      >
-        <div className="min-w-0 flex-1">
-          <label htmlFor="github-add-repository" className="text-sm font-medium text-foreground">Repository</label>
-          <Input
-            id="github-add-repository"
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            placeholder="owner/repository"
-            autoComplete="off"
-            disabled={adding}
-            className="mt-2 h-10"
-          />
-        </div>
-        <Button size="sm" type="submit" className="h-10 @[48rem]:shrink-0" disabled={adding || value.trim().length === 0}>
-          {adding ? "Adding…" : "Add repository"}
-        </Button>
-      </form>
-    </section>
+    <form
+      className="flex flex-col gap-2 border-b border-border p-3 @[48rem]:flex-row @[48rem]:items-center"
+      onSubmit={submit}
+    >
+      <label htmlFor="github-add-repository" className="sr-only">
+        Repository
+      </label>
+      <Input
+        id="github-add-repository"
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        placeholder="Add owner/repository"
+        autoComplete="off"
+        disabled={adding}
+        className="h-9"
+      />
+      <Button size="sm" type="submit" className="h-9 gap-1.5 @[48rem]:shrink-0" disabled={adding || value.trim().length === 0} aria-busy={adding}>
+        {adding ? <Spinner className="size-3" /> : null}
+        {adding ? "Adding…" : "Add"}
+      </Button>
+    </form>
   );
 }
 
@@ -2902,6 +3232,7 @@ function RepositoryManager({
     items: Item[];
     alerts: DependabotAlert[];
   } | null>(null);
+  const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const requestRef = useRef(0);
   const reposKey = status.repos.map((entry) => entry.repo).join("\u0000");
@@ -2917,8 +3248,10 @@ function RepositoryManager({
     if (repos.length === 0) {
       setSummary({ items: [], alerts: [] });
       setLoadError(null);
+      setLoading(false);
       return;
     }
+    setLoading(true);
     Promise.all([
       rpc.call("listItems", {}),
       rpc.call("listDependabotAlerts", { repos }),
@@ -2932,19 +3265,18 @@ function RepositoryManager({
             : [],
         });
         setLoadError(null);
+        setLoading(false);
       },
       (reason: unknown) => {
         if (requestId === requestRef.current && requestKey === activeReposKey.current) {
-          setSummary(null);
           setLoadError(errorText(reason));
+          setLoading(false);
         }
       },
     );
   }, [rpc, reposKey]);
 
   useEffect(() => {
-    requestRef.current += 1;
-    setSummary(null);
     setLoadError(null);
     load();
     return () => {
@@ -2965,31 +3297,22 @@ function RepositoryManager({
   };
 
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border bg-muted/50 px-4 py-3">
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground">Tracked repositories</h2>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            Repositories feeding your Issues, PRs, and Dependabot views.
-          </p>
-        </div>
-        <div className="flex flex-col items-end gap-1 text-xs text-muted-foreground">
-          <span className="rounded-full border border-border bg-card px-2 py-0.5 font-medium text-foreground">
-            {status.repos.length}
-          </span>
-          <span className="whitespace-nowrap">
-            {status.lastSyncedAt !== null ? `Last synced ${relativeTime(status.lastSyncedAt)}` : "Not synced yet"}
-          </span>
-        </div>
-      </div>
+    <div aria-busy={loading || busy !== null}>
+      {loading && summary !== null ? (
+        <>
+          <span className="sr-only">Updating repositories</span>
+          <RefreshBar visible />
+        </>
+      ) : null}
       {loadError !== null ? (
         <EmptyState
+          title="Couldn't load repository details"
           message={`Could not load repository details: ${loadError}`}
           onRetry={load}
         />
       ) : null}
       {status.repos.length === 0 ? (
-        <p className="px-4 py-4 text-sm text-muted-foreground">
+        <p className="px-4 py-3 text-sm text-muted-foreground">
           No repositories yet. Add an owner/repo above or attach a BB project with a GitHub origin.
         </p>
       ) : (
@@ -3000,13 +3323,7 @@ function RepositoryManager({
             const alertCount = summary === null
               ? health.alertCount
               : summary.alerts.filter((alert) => alert.repo === entry.repo && alert.state.toLowerCase() === "open").length;
-            const dot = health.status === "healthy"
-              ? "bg-green-500"
-              : health.status === "syncing"
-                ? "animate-pulse bg-yellow-500"
-                : health.status === "failed"
-                  ? "bg-red-500"
-                  : "bg-muted-foreground/50";
+            const dot = repoHealthDotClass(health.status);
             const dependabotError = health.error !== null && health.error.startsWith("Dependabot:")
               ? health.error
               : null;
@@ -3033,13 +3350,16 @@ function RepositoryManager({
                 <div className="flex flex-wrap gap-2 @[48rem]:flex-nowrap">
                   {[[items.filter((item) => item.kind === "issue" && item.state === "OPEN").length, "Issues"], [items.filter((item) => item.kind === "pr" && item.state === "OPEN").length, "PRs"], [alertCount, "Alerts"]].map(([count, label]) => (
                     <div key={label} className="min-w-0 flex-1 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
-                      <span className="block text-sm font-medium text-foreground">{summary === null ? "—" : count}</span>
+                      <span className="block text-sm font-medium text-foreground">
+                        {summary === null ? (loading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
+                      </span>
                       <span className="block truncate text-[11px] text-muted-foreground">{label}</span>
                     </div>
                   ))}
                 </div>
                 <div className="flex shrink-0 items-center justify-end gap-1">
-                  <Button size="sm" variant="ghost" className="h-8 px-2" disabled={busy !== null} onClick={() => run(entry.repo, () => rpc.call("refreshRepository", { repo: entry.repo }))} aria-label={`Refresh ${entry.repo}`} title={`Refresh ${entry.repo}`}>
+                  <Button size="sm" variant="ghost" className="h-8 gap-1.5 px-2" disabled={busy !== null} aria-busy={busy === entry.repo} onClick={() => run(entry.repo, () => rpc.call("refreshRepository", { repo: entry.repo }))} aria-label={`Refresh ${entry.repo}`} title={`Refresh ${entry.repo}`}>
+                    {busy === entry.repo ? <Spinner className="size-3" /> : null}
                     {busy === entry.repo ? "Syncing…" : "Refresh"}
                   </Button>
                   {entry.projectId === null ? (
@@ -3052,6 +3372,79 @@ function RepositoryManager({
             );
           })}
         </div>
+      )}
+    </div>
+  );
+}
+
+function repoHealthSummary(status: Status | null): string {
+  if (status === null) return "not synced";
+  return summarizeRepoHealth(status.repos.map((entry) => entry.health.status));
+}
+
+function RepoHealthDots({ status }: { status: Status | null }) {
+  const groups =
+    status === null || status.repos.length === 0
+      ? [{ tone: "muted" as const, count: 0 }]
+      : repoHealthColorCounts(status.repos.map((entry) => entry.health.status));
+  return (
+    <span className="flex items-center gap-1.5" aria-hidden="true">
+      {groups.map((group) => (
+        <span key={group.tone} className="inline-flex items-center gap-1">
+          <span
+            className={
+              "size-2 rounded-full " +
+              repoHealthDotClass(
+                group.tone === "muted"
+                  ? "never"
+                  : group.tone === "healthy"
+                    ? "healthy"
+                    : group.tone === "syncing"
+                      ? "syncing"
+                      : "failed",
+              )
+            }
+          />
+          {group.count > 0 ? (
+            <span className="text-[11px] font-medium tabular-nums leading-none">
+              {group.count}
+            </span>
+          ) : null}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function ReposDrawer({
+  status,
+  onSelectRepo,
+}: {
+  status: Status | null;
+  onSelectRepo: (repo: string) => void;
+}) {
+  return (
+    <section className="overflow-hidden rounded-xl border border-border bg-card">
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-2.5">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-foreground">Tracked repositories</h2>
+          <p className="text-xs text-muted-foreground">
+            {status === null
+              ? "Loading tracked repositories…"
+              : status.lastSyncedAt !== null
+                ? `Last synced ${relativeTime(status.lastSyncedAt)}`
+                : "Not synced yet"}
+          </p>
+        </div>
+        <span className="rounded-full border border-border bg-background px-2 py-0.5 text-xs font-medium text-foreground">
+          {status?.repos.length ?? "—"}
+        </span>
+      </div>
+      <AddRepositoryForm />
+      {status !== null ? (
+        <RepositoryManager status={status} onSelectRepo={onSelectRepo} />
+      ) : (
+        <RepositoryManagerSkeleton />
       )}
     </section>
   );
@@ -3192,6 +3585,7 @@ function DependabotListView({
     stats: { totalCount: number; highCriticalCount: number; withFixCount: number; withoutFixCount: number };
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const filter = useMemo(() => DependabotFilter(query), [query]);
   const selectedRepos = useMemo(() => {
     if (filter.repos.length === 0) return undefined;
@@ -3206,6 +3600,7 @@ function DependabotListView({
   const load = useCallback(() => {
     const requestId = ++requestRef.current;
     const requestKey = selectedReposKey;
+    setLoading(true);
     rpc.call(
       "listDependabotAlerts",
       selectedRepos === undefined ? {} : { repos: selectedRepos },
@@ -3214,24 +3609,28 @@ function DependabotListView({
         if (requestId !== requestRef.current || requestKey !== activeRequestKey.current) return;
         setResult(next as typeof result);
         setError(null);
+        setLoading(false);
       },
       (reason: unknown) => {
         if (requestId === requestRef.current && requestKey === activeRequestKey.current) {
-          setResult(null);
           setError(errorText(reason));
+          setLoading(false);
         }
       },
     );
   }, [rpc, selectedRepos, selectedReposKey]);
+  const selectedReposKeyRef = useRef(selectedReposKey);
   useEffect(() => {
-    requestRef.current += 1;
-    setResult(null);
+    if (selectedReposKeyRef.current !== selectedReposKey) {
+      setResult(null);
+      selectedReposKeyRef.current = selectedReposKey;
+    }
     setError(null);
     load();
     return () => {
       requestRef.current += 1;
     };
-  }, [load]);
+  }, [load, selectedReposKey]);
   useRealtime("data-changed", load);
 
   const alerts = useMemo(() => {
@@ -3268,26 +3667,29 @@ function DependabotListView({
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-sm text-muted-foreground">Open Dependabot security alerts on tracked repositories.</p>
-      <SavedViewsBar tab="dependabot" query={query} onChange={setQuery} />
-      <FilterBar
-        value={query}
-        onChange={setQuery}
-        items={null}
-        repos={repos}
-        kind="dependabot"
-        placeholder="Filter — repo:owner/name severity:high fix:yes, or plain text"
-      />
+      <div className="sticky top-0 z-10 flex flex-col gap-2 bg-background pb-1">
+        <FilterBar
+          value={query}
+          onChange={setQuery}
+          items={null}
+          repos={repos}
+          kind="dependabot"
+          placeholder="Filter — repo:owner/name severity:high fix:yes, or plain text"
+        />
+        <SavedViewsBar tab="dependabot" query={query} onChange={setQuery} />
+      </div>
       <div className="github-stats-grid">
         {[
-          ["Alerts", displayStats === null ? "—" : displayStats.totalCount],
-          ["High / critical", displayStats === null ? "—" : displayStats.highCriticalCount],
-          ["With fix", displayStats === null ? "—" : displayStats.withFixCount],
-          ["No fix", displayStats === null ? "—" : displayStats.withoutFixCount],
+          ["Alerts", displayStats?.totalCount],
+          ["High / critical", displayStats?.highCriticalCount],
+          ["With fix", displayStats?.withFixCount],
+          ["No fix", displayStats?.withoutFixCount],
         ].map(([label, value]) => (
           <div key={String(label)} className="rounded-lg border border-border bg-card px-3 py-2">
             <p className="text-xs text-muted-foreground">{label}</p>
-            <p className="text-lg font-semibold text-foreground">{value}</p>
+            <p className="text-lg font-semibold text-foreground">
+              {displayStats === null ? <Skeleton className="mt-1 h-6 w-10" /> : value}
+            </p>
           </div>
         ))}
       </div>
@@ -3296,14 +3698,40 @@ function DependabotListView({
       ))}
       <div
         className="@container overflow-hidden rounded-lg border border-border bg-card"
-        aria-busy={result === null && error === null}
+        aria-busy={loading}
       >
-        {error !== null ? (
-          <EmptyState message={error} onRetry={load} />
+        {loading && result !== null ? (
+          <>
+            <span className="sr-only">Updating Dependabot alerts</span>
+            <RefreshBar visible />
+          </>
+        ) : null}
+        {error !== null && result !== null ? (
+          <div
+            role="alert"
+            className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-xs text-red-600 dark:text-red-400"
+          >
+            <span>Could not refresh Dependabot alerts: {error}</span>
+            <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={load}>
+              Retry
+            </Button>
+          </div>
+        ) : null}
+        {error !== null && result === null ? (
+          <EmptyState
+            title="Couldn't load Dependabot alerts"
+            message={error}
+            onRetry={load}
+          />
         ) : pageAlerts === null ? (
-          <TableSkeleton />
+          <TableSkeleton label="Loading Dependabot alerts" />
         ) : pageAlerts.length === 0 ? (
-          <EmptyState message={query.trim().length > 0 ? "No Dependabot alerts match this filter." : "No open Dependabot security alerts found on the tracked repositories."} />
+          <EmptyState
+            title={query.trim().length > 0 ? "No matches" : "No alerts"}
+            message={query.trim().length > 0 ? "No Dependabot alerts match this filter." : "No open Dependabot security alerts found on the tracked repositories."}
+            actionLabel={query.trim().length > 0 ? "Clear filter" : undefined}
+            onAction={query.trim().length > 0 ? () => setQuery("") : undefined}
+          />
         ) : (
           <>
             <div className="hidden items-center gap-3 border-b border-border bg-muted/50 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground @[48rem]:flex">
@@ -3401,6 +3829,7 @@ function DependabotDetailView({
   const rpc = useRpc<typeof githubRpcContract>();
   const [alert, setAlert] = useState<DependabotAlertDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const detailKey = `${repo}#${number}`;
   const activeDetailKey = useRef(detailKey);
   activeDetailKey.current = detailKey;
@@ -3409,6 +3838,7 @@ function DependabotDetailView({
   const load = useCallback(() => {
     const requestId = ++loadRequest.current;
     const requestKey = detailKey;
+    setLoading(true);
     rpc.call("getDependabotAlert", { repo, number }).then(
       (result) => {
         if (requestId !== loadRequest.current || activeDetailKey.current !== requestKey) return;
@@ -3416,14 +3846,17 @@ function DependabotDetailView({
         if (detail === undefined || detail === null) {
           setAlert(null);
           setError("malformed getDependabotAlert result");
+          setLoading(false);
           return;
         }
         setAlert(detail);
         setError(null);
+        setLoading(false);
       },
       (reason: unknown) => {
         if (requestId === loadRequest.current && activeDetailKey.current === requestKey) {
           setError(errorText(reason));
+          setLoading(false);
         }
       },
     );
@@ -3431,11 +3864,23 @@ function DependabotDetailView({
   useEffect(() => {
     setAlert(null);
     setError(null);
+    setLoading(true);
     load();
+    return () => {
+      loadRequest.current += 1;
+    };
   }, [load]);
 
-  if (error !== null) return <EmptyState message={error} onRetry={load} />;
-  if (alert === null) return <DetailSkeleton />;
+  if (alert === null && error !== null) {
+    return (
+      <EmptyState
+        title="Couldn't load Dependabot alert"
+        message={error}
+        onRetry={load}
+      />
+    );
+  }
+  if (alert === null) return <DetailSkeleton label="Loading Dependabot alert" />;
 
   const patchedVersion =
     alert.vulnerabilities.find((entry) => entry.firstPatchedVersion !== null)
@@ -3448,7 +3893,19 @@ function DependabotDetailView({
   const displayDate = (value: string) => relativeTime(value) || value || "—";
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5" aria-busy={loading}>
+      {loading ? <RefreshBar visible /> : null}
+      {error !== null ? (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-xs text-red-600 dark:text-red-400"
+        >
+          <span>Could not refresh this alert: {error}</span>
+          <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={load}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
           ← Dependabot
@@ -3643,7 +4100,7 @@ function ListView({
   repos: RepoInfo[];
   onOpenItem: (repo: string, number: number) => void;
 }) {
-  const { items, error, refetch } = useItems(kind);
+  const { items, error, loading, refetch } = useItems(kind);
   const viewer = useViewer();
   const parsed = useMemo(() => parseQuery(query), [query]);
   const filtered = useMemo(
@@ -3662,28 +4119,44 @@ function ListView({
   const pageItems = filtered === null || !paginated ? filtered : filtered.slice(visiblePage * pageSize, (visiblePage + 1) * pageSize);
   return (
     <div className="flex flex-col gap-3">
-      <SavedViewsBar tab={kind === "pr" ? "pulls" : "issues"} query={query} onChange={setQuery} />
-      <FilterBar
-        value={query}
-        onChange={setQuery}
-        items={items}
-        repos={repos}
-        kind={kind}
-      />
-      {filtered !== null ? (
+      <div className="sticky top-0 z-10 flex flex-col gap-2 bg-background pb-1">
+        <FilterBar
+          value={query}
+          onChange={setQuery}
+          items={items}
+          repos={repos}
+          kind={kind}
+        />
+        <SavedViewsBar tab={kind === "pr" ? "pulls" : "issues"} query={query} onChange={setQuery} />
+      </div>
+      {filtered === null ? (
+        <div className="flex items-center justify-between px-1">
+          <Skeleton className="h-3 w-28" />
+          <Skeleton className="h-3 w-40" />
+        </div>
+      ) : (
         <div className="flex items-center justify-between px-1 text-xs text-muted-foreground" aria-live="polite">
           <span className="font-medium text-foreground">
             {filtered.length} {kind === "pr" ? "pull requests" : "issues"}
           </span>
-          <span>{query.trim().length > 0 ? "Filtered results" : "Across tracked repositories"}</span>
+          {loading ? (
+            <span className="inline-flex items-center gap-1.5">
+              <Spinner className="size-3" />
+              Updating
+            </span>
+          ) : (
+            <span>{query.trim().length > 0 ? "Filtered results" : "Across tracked repositories"}</span>
+          )}
         </div>
-      ) : null}
+      )}
       <ItemsTable
         kind={kind}
         items={pageItems}
         error={error}
+        loading={loading}
         hasFilter={query.trim().length > 0}
         onRetry={refetch}
+        onClearFilter={() => setQuery("")}
         onOpenItem={onOpenItem}
         page={visiblePage}
         pageCount={pageCount}
@@ -3700,6 +4173,7 @@ function GithubPanelBody({
   route,
   navigate,
   status,
+  loading,
   query,
   setQuery,
   onRetryStatus,
@@ -3707,11 +4181,16 @@ function GithubPanelBody({
   route: Route;
   navigate: (route: Route) => void;
   status: Status | null;
+  loading: boolean;
   query: string;
   setQuery: (query: string) => void;
   onRetryStatus: () => void;
 }) {
-  const selectRepo = useCallback((repo: string) => setQuery(`repo:${repo}`), [setQuery]);
+  const [reposOpen, setReposOpen] = useState(false);
+  const selectRepo = useCallback((repo: string) => {
+    setQuery(`repo:${repo}`);
+    setReposOpen(false);
+  }, [setQuery]);
   const openItem = useCallback(
     (itemKind: "issue" | "pr", repo: string, number: number) => {
       navigate(
@@ -3722,9 +4201,13 @@ function GithubPanelBody({
     },
     [navigate],
   );
+  useEffect(() => {
+    if (status !== null && status.repos.length === 0) setReposOpen(true);
+  }, [status]);
   if (status !== null && status.ghState === "unavailable") {
     return (
       <EmptyState
+        title="GitHub is unreachable"
         message={`GitHub CLI could not reach GitHub. Check your network or keychain; the plugin retries by itself. (${status.ghError ?? ""})`}
         onRetry={onRetryStatus}
         retryLabel="Retry GitHub status"
@@ -3734,6 +4217,7 @@ function GithubPanelBody({
   if (status !== null && !status.ghOk) {
     return (
       <EmptyState
+        title="GitHub CLI isn't ready"
         message={`GitHub CLI is not available or not authenticated. Install it from cli.github.com, run \`gh auth login\`, then reload the plugin. (${status.ghError ?? ""})`}
         onRetry={onRetryStatus}
         retryLabel="Retry GitHub status"
@@ -3784,77 +4268,86 @@ function GithubPanelBody({
     );
   }
 
-  if (route.view === "dependabot") {
-    return (
-      <div className="flex flex-col gap-3">
-        <AddRepositoryForm />
-        {status !== null ? <RepositoryManager status={status} onSelectRepo={selectRepo} /> : null}
-        <Tabs
-          value="dependabot"
-          onValueChange={(value) => {
-            navigate(
-              value === "pulls"
-                ? { view: "pulls" }
-                : value === "dependabot"
-                  ? { view: "dependabot" }
-                  : { view: "issues" },
-            );
-          }}
-        >
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-2">
-              <TabsList>
-                <TabsTrigger value="issues">Issues</TabsTrigger>
-                <TabsTrigger value="pulls">Pull requests</TabsTrigger>
-                <TabsTrigger value="dependabot">Dependabot</TabsTrigger>
-              </TabsList>
-            </div>
-            <TabsPanel value="dependabot">
-              <DependabotListView
-                query={query}
-                setQuery={setQuery}
-                repos={status?.repos ?? []}
-                onOpenAlert={(repo, number) => navigate({ view: "dependabot-alert", repo, number })}
-              />
-            </TabsPanel>
-          </div>
-        </Tabs>
-      </div>
-    );
-  }
+  const listTab =
+    route.view === "pulls"
+      ? "pulls"
+      : route.view === "dependabot"
+        ? "dependabot"
+        : "issues";
+  const kind = listTab === "pulls" ? "pr" : "issue";
+  const repoCount = status?.repos.length ?? 0;
+  const refreshing = loading || status?.syncing === true;
 
-  const kind = route.view === "pulls" ? "pr" : "issue";
   return (
-    <div className="flex flex-col gap-3">
-      <AddRepositoryForm />
-      {status !== null ? <RepositoryManager status={status} onSelectRepo={selectRepo} /> : null}
-      <Tabs
-        value={route.view}
-        onValueChange={(value) => {
-          navigate(
-            value === "pulls"
-              ? { view: "pulls" }
-              : value === "dependabot"
-                ? { view: "dependabot" }
-                : { view: "issues" },
-          );
-        }}
-      >
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center gap-2">
-            <TabsList>
-              <TabsTrigger value="issues">Issues</TabsTrigger>
-              <TabsTrigger value="pulls">Pull requests</TabsTrigger>
-              <TabsTrigger value="dependabot">Dependabot</TabsTrigger>
-            </TabsList>
-            <div className="flex-1" />
-            {route.view === "issues" ? (
-              <Button size="sm" onClick={() => navigate({ view: "new" })}>
-                New issue
-              </Button>
-            ) : null}
+    <Tabs
+      value={listTab}
+      onValueChange={(value) => {
+        navigate(
+          value === "pulls"
+            ? { view: "pulls" }
+            : value === "dependabot"
+              ? { view: "dependabot" }
+              : { view: "issues" },
+        );
+      }}
+    >
+      <div className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <TabsList>
+            <TabsTrigger value="issues">Issues</TabsTrigger>
+            <TabsTrigger value="pulls">Pull requests</TabsTrigger>
+            <TabsTrigger value="dependabot">Dependabot</TabsTrigger>
+          </TabsList>
+          <div className="flex-1" />
+          <Button
+            size="sm"
+            variant={reposOpen ? "secondary" : "outline"}
+            className="h-8 gap-1.5"
+            aria-expanded={reposOpen}
+            aria-controls="github-repos-drawer"
+            aria-busy={refreshing}
+            aria-label={
+              status === null
+                ? refreshing
+                  ? "Loading repositories"
+                  : "Repositories"
+                : `${repoCount} repo${repoCount === 1 ? "" : "s"}, ${repoHealthSummary(status)}${refreshing ? ", refreshing" : ""}`
+            }
+            title={
+              status === null
+                ? refreshing
+                  ? "Loading repositories"
+                  : "Repositories"
+                : refreshing
+                  ? `Refreshing · ${repoHealthSummary(status)}`
+                  : repoHealthSummary(status)
+            }
+            onClick={() => setReposOpen((open) => !open)}
+          >
+            {refreshing ? <Spinner className="size-3" /> : null}
+            <RepoHealthDots status={status} />
+            {status === null ? "Repos" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
+          </Button>
+          {listTab === "issues" ? (
+            <Button size="sm" className="h-8" onClick={() => navigate({ view: "new" })}>
+              New issue
+            </Button>
+          ) : null}
+        </div>
+        {reposOpen ? (
+          <div id="github-repos-drawer">
+            <ReposDrawer status={status} onSelectRepo={selectRepo} />
           </div>
-          <TabsPanel value={route.view}>
+        ) : null}
+        <TabsPanel value={listTab}>
+          {listTab === "dependabot" ? (
+            <DependabotListView
+              query={query}
+              setQuery={setQuery}
+              repos={status?.repos ?? []}
+              onOpenAlert={(repo, number) => navigate({ view: "dependabot-alert", repo, number })}
+            />
+          ) : (
             <ListView
               kind={kind}
               query={query}
@@ -3864,10 +4357,10 @@ function GithubPanelBody({
                 openItem(kind === "pr" ? "pr" : "issue", repo, number)
               }
             />
-          </TabsPanel>
-        </div>
-      </Tabs>
-    </div>
+          )}
+        </TabsPanel>
+      </div>
+    </Tabs>
   );
 }
 

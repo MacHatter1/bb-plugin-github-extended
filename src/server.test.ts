@@ -7,6 +7,7 @@ import {
   dependabotAlertFromRow,
   fetchRepoItems,
   githubRpcContract,
+  isRepositoryAccessDenied,
   parseDependabotAlerts,
   parseExtraRepos,
   parseGithubPullUrl,
@@ -243,6 +244,29 @@ describe("GitHub RPC contract", () => {
       "bad/repo/shape",
       "acme",
     ]);
+  });
+
+  it("treats lost repository access as durable, not a retryable blip", () => {
+    expect(isRepositoryAccessDenied(new Error("repository access denied"))).toBe(true);
+    expect(isRepositoryAccessDenied(new Error("gh: Not Found (HTTP 404)"))).toBe(true);
+    expect(
+      isRepositoryAccessDenied(
+        new Error("GraphQL: Could not resolve to a Repository with the name 'acme/widgets'."),
+      ),
+    ).toBe(true);
+    expect(isRepositoryAccessDenied(new Error("API rate limit exceeded"))).toBe(false);
+    expect(
+      isRepositoryAccessDenied(
+        new Error("gh: Dependabot alerts are disabled for this repository. (HTTP 403)"),
+      ),
+    ).toBe(false);
+    expect(
+      isRepositoryAccessDenied(
+        new Error("Resource protected by organization SAML enforcement"),
+      ),
+    ).toBe(false);
+    expect(isRepositoryAccessDenied(new Error("error connecting to api.github.com"))).toBe(false);
+    expect(isRepositoryAccessDenied(new Error("could not resolve host api.github.com"))).toBe(false);
   });
 
   it("accepts supported GitHub URLs only for the exact host", () => {

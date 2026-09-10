@@ -101,18 +101,53 @@ export function Skeleton({ className, ...props }: HTMLAttributes<HTMLDivElement>
   return <div {...props} className={cn("animate-pulse rounded-md bg-muted", className)} />;
 }
 
-export function DelayedLoading({ children }: { children: ReactNode }) {
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const timer = setTimeout(() => setVisible(true), 200);
-    return () => clearTimeout(timer);
-  }, []);
-  return visible ? (
-    <div role="status" aria-live="polite" aria-busy="true">
-      <span className="sr-only">Loading…</span>
-      {children}
+export function Spinner({ className }: { className?: string }) {
+  return (
+    <svg
+      className={cn("size-3 animate-spin", className)}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle
+        cx="12"
+        cy="12"
+        r="9"
+        stroke="currentColor"
+        strokeWidth="2"
+        className="opacity-25"
+      />
+      <path
+        d="M21 12a9 9 0 0 0-9-9"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+export function RefreshBar({ visible }: { visible: boolean }) {
+  if (!visible) return null;
+  return (
+    <div
+      className="github-refresh-track relative h-0.5 overflow-hidden bg-muted"
+      aria-hidden="true"
+    >
+      <div className="github-refresh-bar absolute inset-y-0 w-1/3 rounded-full bg-foreground/70" />
     </div>
-  ) : null;
+  );
+}
+
+export function MenuLoading({ label }: { label: string }) {
+  return (
+    <div className="flex flex-col gap-1 px-2 py-1.5" role="status" aria-label={label}>
+      <span className="sr-only">{label}</span>
+      <Skeleton className="h-7 w-full" />
+      <Skeleton className="h-7 w-5/6" />
+      <Skeleton className="h-7 w-2/3" />
+    </div>
+  );
 }
 
 interface MenuContextValue {

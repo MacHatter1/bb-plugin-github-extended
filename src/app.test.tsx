@@ -185,6 +185,47 @@ describe("GitHub app navigation", () => {
     slot.lifecycle.unmount();
   });
 
+  it("keeps repository management collapsed until opened", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          listItems: () => ({ items: [] }),
+          listLinks: () => ({ links: {} }),
+          status: () => ({
+            ghOk: true,
+            ghState: "ready",
+            ghError: null,
+            repos: [{
+              repo: "acme/widgets",
+              projectId: null,
+              health: {
+                status: "ok",
+                lastAttemptAt: null,
+                lastSuccessAt: null,
+                itemCount: 1,
+                alertCount: 0,
+                error: null,
+              },
+            }],
+            lastSyncedAt: "2026-08-20T00:00:00.000Z",
+          }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.queryByPlaceholderText("Add owner/repository")).toBeNull();
+    const reposToggle = slot.getByRole("button", { name: "1 repo" });
+    expect(reposToggle.getAttribute("aria-expanded")).toBe("false");
+    await reposToggle.click();
+    expect(reposToggle.getAttribute("aria-expanded")).toBe("true");
+    expect(slot.getByPlaceholderText("Add owner/repository")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
   it("exposes filter suggestions as a combobox without trapping Tab", async () => {
     const slot = renderSlot(
       app.navPanels[0]!,
@@ -837,7 +878,7 @@ describe("GitHub app navigation", () => {
       method: "linkPullToThread",
       input: { threadId: "thr-picker", repo: "acme/widgets", number: 42 },
     });
-    expect(slot.getByRole("status").textContent).toContain("Linking pull request");
+    expect(slot.getByText("Linking pull request…")).toBeTruthy();
     expect(resolveLink).toBeDefined();
 
     await act(async () => {
@@ -887,7 +928,7 @@ describe("GitHub app navigation", () => {
     await act(async () => {});
     await slot.getByText("Linkable PR").click();
     await act(async () => {});
-    expect(slot.getByRole("status").textContent).toContain("Linking pull request");
+    expect(slot.getByText("Linking pull request…")).toBeTruthy();
 
     slot.lifecycle.rerender(
       createElement(app.threadPanelActions[0]!.component as any, {
@@ -896,7 +937,7 @@ describe("GitHub app navigation", () => {
       }),
     );
     await act(async () => {});
-    expect(slot.queryByRole("status")).toBeNull();
+    expect(slot.queryByText("Linking pull request…")).toBeNull();
     const picker = slot.getByText("Linkable PR").closest("button");
     expect(picker).toBeTruthy();
     expect((picker as HTMLButtonElement).disabled).toBe(false);
@@ -905,4 +946,175 @@ describe("GitHub app navigation", () => {
     slot.lifecycle.unmount();
   });
 
+});
+
+describe("GitHub loading states", () => {
+  const readyStatus = {
+    ghOk: true,
+    ghState: "ready",
+    ghError: null,
+    repos: [],
+    lastSyncedAt: null,
+  };
+
+  function issueItem(title: string, number = 1) {
+    return {
+      repo: "acme/widgets",
+      number,
+      kind: "issue" as const,
+      title,
+      state: "OPEN",
+      author: "octocat",
+      labels: [],
+      assignees: [],
+      url: `https://github.com/acme/widgets/issues/${number}`,
+      body: "",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+    };
+  }
+
+  it("shows an issues skeleton immediately while the list is pending", async () => {
+    let resolveItems: ((value: unknown) => void) | undefined;
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listItems: () =>
+            new Promise((resolve) => {
+              resolveItems = resolve;
+            }),
+          listLinks: () => ({ links: {} }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByRole("status", { name: "Loading issues" })).toBeTruthy();
+    await act(async () => {
+      resolveItems?.({ items: [] });
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps cached issue rows visible while a refresh is in flight", async () => {
+    let listCalls = 0;
+    let resolveRefresh: ((value: unknown) => void) | undefined;
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listItems: () => {
+            listCalls += 1;
+            if (listCalls === 1) return { items: [issueItem("Cached issue")] };
+            return new Promise((resolve) => {
+              resolveRefresh = resolve;
+            });
+          },
+          listLinks: () => ({ links: {} }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByText("Cached issue")).toBeTruthy();
+
+    await slot.behavior.emitRealtime("data-changed", {});
+    await act(async () => {});
+    expect(slot.getByText("Cached issue")).toBeTruthy();
+    expect(slot.queryByRole("status", { name: "Loading issues" })).toBeNull();
+    expect(slot.getByText("Updating")).toBeTruthy();
+    expect(resolveRefresh).toBeDefined();
+
+    await act(async () => {
+      resolveRefresh?.({ items: [issueItem("Fresh issue", 2)] });
+    });
+    expect(slot.getByText("Fresh issue")).toBeTruthy();
+    expect(slot.queryByText("Cached issue")).toBeNull();
+    expect(slot.queryByText("Updating")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a checking state in the panel header before status arrives", async () => {
+    const header = app.navPanels[0]!.headerContent;
+    expect(header).toBeDefined();
+    let resolveStatus: ((value: unknown) => void) | undefined;
+    const slot = renderSlot(
+      { component: header! },
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () =>
+            new Promise((resolve) => {
+              resolveStatus = resolve;
+            }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByText("Checking GitHub…")).toBeTruthy();
+    await act(async () => {
+      resolveStatus?.(readyStatus);
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("shows Dependabot stat skeletons while alerts are loading", async () => {
+    let resolveAlerts: ((value: unknown) => void) | undefined;
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "dependabot" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listDependabotAlerts: () =>
+            new Promise((resolve) => {
+              resolveAlerts = resolve;
+            }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByRole("status", { name: "Loading Dependabot alerts" })).toBeTruthy();
+    expect(slot.getByText("High / critical")).toBeTruthy();
+    await act(async () => {
+      resolveAlerts?.({
+        alerts: [],
+        errors: [],
+        stats: { totalCount: 0, highCriticalCount: 0, withFixCount: 0, withoutFixCount: 0 },
+      });
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a compact skeleton while a thread pull lookup is pending", async () => {
+    let resolvePull: ((value: unknown) => void) | undefined;
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thr-loading", params: null },
+      {
+        rpc: {
+          pullForThread: () =>
+            new Promise((resolve) => {
+              resolvePull = resolve;
+            }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByRole("status", { name: "Loading linked pull request" })).toBeTruthy();
+    await act(async () => {
+      resolvePull?.({ pull: null });
+    });
+    slot.lifecycle.unmount();
+  });
 });

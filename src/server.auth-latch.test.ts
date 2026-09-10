@@ -99,7 +99,10 @@ async function loadWithSyncServiceOnce(
   const { controller, done } = harness.runService("sync");
   await vi.waitFor(
     () => {
-      expect(ghCalls().length).toBeGreaterThan(callsBeforeService);
+      const syncSettled = harness.logEntries.some((entry) =>
+        /synced \d+ item|sync failed/.test(entry.message),
+      );
+      expect(ghCalls().length > callsBeforeService || syncSettled).toBe(true);
     },
     { timeout: 4_000 },
   );
@@ -218,7 +221,7 @@ describe("github plugin gh auth probe (#1758)", () => {
       expect.arrayContaining([
         expect.objectContaining({
           level: "warn",
-          message: expect.stringMatching(/2 of 2 repo/),
+          message: expect.stringMatching(/sync failed for acme\/(one|two)/),
         }),
       ]),
     );

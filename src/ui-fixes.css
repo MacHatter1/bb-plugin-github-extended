@@ -186,3 +186,113 @@
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .sr-only,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .animate-spin,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).animate-spin {
+  animation: github-spin 0.8s linear infinite;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .opacity-25,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).opacity-25 {
+  opacity: 0.25;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .h-0\.5,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).h-0\.5 {
+  height: 0.125rem;
+}
+
+@keyframes github-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes github-refresh-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .github-refresh-bar,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).github-refresh-bar {
+  animation: github-refresh-slide 1.05s ease-in-out infinite;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .pl-9,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).pl-9 {
+  padding-left: calc(var(--spacing) * 9);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .left-3,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).left-3 {
+  left: calc(var(--spacing) * 3);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .size-3\.5,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).size-3\.5 {
+  width: calc(var(--spacing) * 3.5);
+  height: calc(var(--spacing) * 3.5);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .sticky,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).sticky {
+  position: sticky;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .top-0,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).top-0 {
+  top: 0;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .z-10,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).z-10 {
+  z-index: 10;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .rounded-xl,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).rounded-xl {
+  border-radius: 0.75rem;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .pb-1,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).pb-1 {
+  padding-bottom: calc(var(--spacing) * 1);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .py-2\.5,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).py-2\.5 {
+  padding-top: calc(var(--spacing) * 2.5);
+  padding-bottom: calc(var(--spacing) * 2.5);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .gap-0\.5,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).gap-0\.5 {
+  gap: calc(var(--spacing) * 0.5);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .pl-0\.5,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).pl-0\.5 {
+  padding-left: calc(var(--spacing) * 0.5);
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .tabular-nums,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

@@ -173,11 +173,16 @@ beforeEach(() => {
     join(binDir, "gh"),
     `#!/usr/bin/env bash
 echo "$*" >> "${callLog}"
+if [ -e "${accessDeniedFlag}" ]; then
+  case "$*" in
+    *acme/widgets*) echo "repository access denied" >&2; exit 1;;
+  esac
+fi
 case "$*" in
   "--version") echo "gh version 2.96.0 (fake)";;
   "auth status --hostname github.com --active") echo "authenticated";;
   "api user") printf '%s\n' '{"login":"octocat"}';;
-  "api repos/acme/widgets") if [ -e "${accessDeniedFlag}" ]; then echo "repository access denied" >&2; exit 1; else printf '%s\\n' '{}'; fi;;
+  "api repos/acme/widgets") printf '%s\\n' '{}';;
   "api repos/acme/widgets/assignees?per_page=100") printf '%s\n' '[{"login":"zoe"},{"login":"alice"},{"login":""}]';;
   "api repos/acme/widgets/labels?per_page=100") printf '%s\n' '[{"name":"triage"},{"name":" bug "},{"name":""}]';;
   "api --paginate --jq .[] repos/acme/widgets/dependabot/alerts?state=open&per_page=100") if [ -e "${dependabotDisabledFlag}" ]; then echo "gh: Dependabot alerts are disabled for this repository. (HTTP 403)" >&2; exit 1; else printf '%s\n' '[]'; fi;;
@@ -302,7 +307,7 @@ describe("github plugin RPC behavior", () => {
       harness.realtimeSignals.filter(
         (signal) => signal.channel === "data-changed",
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(3);
   });
 
   it("settles the background service without retrying known Dependabot limits", async () => {
@@ -375,6 +380,7 @@ describe("github plugin RPC behavior", () => {
         },
       ],
     });
+    expect(ghCalls().filter((call) => call === "api repos/acme/widgets")).toEqual([]);
     await expect(
       harness.callRpc("listItems", {
         kind: "issue",
@@ -464,7 +470,7 @@ describe("github plugin RPC behavior", () => {
       harness.realtimeSignals.filter(
         (signal) => signal.channel === "data-changed",
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
   });
 
   it("normalizes draft state, checks, review threads, and paginated files", async () => {
@@ -511,7 +517,7 @@ describe("github plugin RPC behavior", () => {
       },
     });
   });
-  it("withholds cached surfaces after repository access is revoked", async () => {
+  it("serves the cache until a refresh sees that repository access was revoked", async () => {
     const { bb, harness } = await loadPlugin();
     await harness.callRpc("refresh");
     await bb.storage.kv.set("link:issue:acme/widgets#7", [{
@@ -523,6 +529,70 @@ describe("github plugin RPC behavior", () => {
     }]);
     writeFileSync(accessDeniedFlag, "");
 
+    const callsBeforeReads = ghCalls().length;
+    await expect(harness.callRpc("listItems", {})).resolves.toMatchObject({
+      items: expect.arrayContaining([
+        expect.objectContaining({ repo: "acme/widgets", number: 7, kind: "issue" }),
+        expect.objectContaining({ repo: "acme/widgets", number: 42, kind: "pr" }),
+      ]),
+    });
+    await expect(harness.callRpc("listDependabotAlerts", {})).resolves.toMatchObject({
+      stats: { totalCount: 0 },
+    });
+    await expect(harness.callRpc("listLinks")).resolves.toMatchObject({
+      links: {
+        "issue:acme/widgets#7": [
+          expect.objectContaining({ threadId: "private-thread" }),
+        ],
+      },
+    });
+    await expect(harness.runCli(["issues"])).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: expect.stringContaining("acme/widgets#7"),
+    });
+    const issueProvider = harness.registrations.mentionProviders.find(
+      (provider) => provider.id === "issue",
+    );
+    if (issueProvider === undefined) throw new Error("issue provider missing");
+    await expect(issueProvider.search({
+      query: "cache",
+      trigger: "@",
+      projectId: "project-1",
+      threadId: "thread-1",
+    })).resolves.toEqual([
+      {
+        id: "acme/widgets#7",
+        title: "#7 Cache mutations",
+        subtitle: "acme/widgets",
+      },
+    ]);
+    await expect(harness.callRpc("status")).resolves.toMatchObject({
+      ghOk: true,
+      lastSyncedAt: expect.any(String),
+      repos: [{
+        repo: "acme/widgets",
+        health: {
+          status: "healthy",
+          itemCount: 2,
+          alertCount: 0,
+        },
+      }],
+    });
+    expect(
+      ghCalls()
+        .slice(callsBeforeReads)
+        .filter((call) =>
+          call.startsWith("api repos/") ||
+          call.startsWith("issue list") ||
+          call.startsWith("pr list"),
+        ),
+    ).toEqual([]);
+
+    await expect(harness.callRpc("refresh")).resolves.toEqual({
+      repos: 1,
+      items: 0,
+    });
+
     await expect(harness.callRpc("listItems", {})).resolves.toEqual({ items: [] });
     await expect(harness.callRpc("listDependabotAlerts", {})).resolves.toMatchObject({
       alerts: [],
@@ -533,10 +603,6 @@ describe("github plugin RPC behavior", () => {
       exitCode: 0,
       stdout: expect.stringContaining("Nothing cached"),
     });
-    const issueProvider = harness.registrations.mentionProviders.find(
-      (provider) => provider.id === "issue",
-    );
-    if (issueProvider === undefined) throw new Error("issue provider missing");
     await expect(issueProvider.search({
       query: "cache",
       trigger: "@",
@@ -556,7 +622,7 @@ describe("github plugin RPC behavior", () => {
         },
       }],
     });
-  });
+  }, 20_000);
 
 
   it("persists picker PR links and ignores issue links for pull lookup", async () => {

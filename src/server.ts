@@ -24,6 +24,7 @@ const CLOSED_PR_PAGE = 30;
 const GH_HINT =
   "Install the GitHub CLI (https://cli.github.com) and run `gh auth login`, " +
   "then `bb plugin reload github-extended`.";
+const REPO_ACCESS_UNAVAILABLE = "Repository access unavailable";
 
 const repoNamePattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$/;
 const repoNameSchema = z.string().regex(repoNamePattern, "expected owner/repo").transform((value) => value.toLowerCase());
@@ -240,6 +241,7 @@ export const githubRpcContract = defineRpcContract({
         ghError: z.string().nullable(),
         repos: z.array(repoStatusSchema),
         lastSyncedAt: z.string().nullable(),
+        syncing: z.boolean(),
       })
       .strict(),
   },
@@ -457,12 +459,26 @@ function isGhUnavailableError(error: unknown): error is Error {
 
 function isTransientGithubError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /timeout|timed out|network|connection|econn|enotfound|could not resolve|temporarily unavailable|service unavailable|rate limit|keychain/i.test(message);
+  return /timeout|timed out|network|connection|econn|enotfound|could not resolve host|temporarily unavailable|service unavailable|rate limit|keychain/i.test(message);
 }
 
 function isKnownDependabotUnavailable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /Dependabot alerts are disabled|admin:repo_hook/i.test(message);
+}
+
+/** Lost repo access (404 / explicit deny), not a blip, rate limit, SSO prompt,
+    or Dependabot-disabled 403. Sync clears that repo's cache; reads do not
+    probe GitHub to find this out. */
+export function isRepositoryAccessDenied(error: unknown): boolean {
+  if (isTransientGithubError(error) || isKnownDependabotUnavailable(error)) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/saml|single sign-on|\bsso\b/i.test(message)) return false;
+  return /repository access denied|could not resolve to a repository|not found \(http 404\)|\(http 404\)|http 404/i.test(
+    message,
+  );
 }
 
 /** gh's own wording when it holds no credentials for the host. */
@@ -575,17 +591,36 @@ export function parseExtraRepos(raw: string): { repos: string[]; ignored: string
 }
 
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function abortError(): Error {
+  return Object.assign(new Error("aborted"), { name: "AbortError" });
+}
+
 function run(
   file: string,
   args: string[],
   timeoutMs = 30_000,
+  signal?: AbortSignal,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    let killed = false;
+    const child = execFile(
       file,
       args,
       { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => {
+        signal?.removeEventListener("abort", onAbort);
+        if (killed || signal?.aborted) {
+          reject(abortError());
+          return;
+        }
         if (error) {
           reject(
             new Error(
@@ -599,6 +634,11 @@ function run(
         }
       },
     );
+    const onAbort = () => {
+      killed = true;
+      child.kill("SIGKILL");
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -987,13 +1027,14 @@ export default async function plugin(bb: BbPluginApi) {
   type GhState = "ready" | "needs_configuration" | "unavailable";
   let ghState: GhState = "unavailable";
   let ghAuthError: string | null = "checking gh…";
+  let abortSync: AbortSignal | null = null;
 
   async function resolveGh(): Promise<string> {
     if (ghPath !== null) return ghPath;
     const candidates = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
     for (const candidate of candidates) {
       try {
-        await run(candidate, ["--version"], 5_000);
+        await run(candidate, ["--version"], 5_000, abortSync ?? undefined);
         ghPath = candidate;
         return candidate;
       } catch {
@@ -1005,7 +1046,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function gh(args: string[], timeoutMs?: number): Promise<string> {
     const file = await resolveGh();
-    const { stdout } = await run(file, args, timeoutMs);
+    const { stdout } = await run(file, args, timeoutMs, abortSync ?? undefined);
     return stdout;
   }
 
@@ -1068,11 +1109,20 @@ export default async function plugin(bb: BbPluginApi) {
   // Concurrent callers (sync loop, panel header + body status RPCs) share one
   // in-flight probe instead of spawning duplicate gh processes.
   let authProbe: Promise<void> | null = null;
+  let lastReadyAt = 0;
+  const AUTH_READY_TTL_MS = 20_000;
   function checkAuth(): Promise<void> {
+    if (ghState === "ready" && Date.now() - lastReadyAt < AUTH_READY_TTL_MS) {
+      return Promise.resolve();
+    }
     if (authProbe === null) {
-      authProbe = probeAuth().finally(() => {
-        authProbe = null;
-      });
+      authProbe = probeAuth()
+        .then(() => {
+          if (ghState === "ready") lastReadyAt = Date.now();
+        })
+        .finally(() => {
+          authProbe = null;
+        });
     }
     return authProbe;
   }
@@ -1129,6 +1179,7 @@ export default async function plugin(bb: BbPluginApi) {
               "git",
               ["-C", source.path, "remote", "get-url", "origin"],
               5_000,
+              abortSync ?? undefined,
             );
             reportedDiscoveryFailures.delete(source.path);
             const repo = parseGithubRemote(stdout);
@@ -1136,6 +1187,7 @@ export default async function plugin(bb: BbPluginApi) {
               byRepo.set(repo, { repo, projectId: project.id });
             }
           } catch (error) {
+            if (isAbortError(error)) throw error;
             projectDiscoveryOk = false;
             const message = error instanceof Error ? error.message : String(error);
             if (reportedDiscoveryFailures.get(source.path) !== message) {
@@ -1215,13 +1267,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function requireTrackedRepo(
     repo: string,
-    checkAccess = true,
+    checkAccess = false,
     cleanup = true,
   ): Promise<RepoInfo> {
     const canonical = canonicalRepoName(repo);
     if (canonical === null) throw new Error(`Invalid repository ${repo}`);
     const info = (await discoverRepos(true, cleanup)).find((entry) => entry.repo === canonical);
     if (info === undefined) throw new Error(`Repository ${canonical} is not tracked`);
+    // Live access checks belong on mutations and sync, not panel reads.
     if (checkAccess) await gh(["api", `repos/${canonical}`], 15_000);
     return info;
   }
@@ -1253,21 +1306,6 @@ export default async function plugin(bb: BbPluginApi) {
     const info = assertTrackedRepoSnapshot(prepared.info.repo, prepared.generation);
     if (checkAccess) await gh(["api", "repos/" + info.repo], 15_000);
     return assertTrackedRepoSnapshot(info.repo, prepared.generation);
-  }
-
-  async function accessibleTrackedRepos(repos: RepoInfo[]): Promise<RepoInfo[]> {
-    if (ghState !== "ready") return [];
-    const accessible = await Promise.all(
-      repos.map(async (repo) => {
-        try {
-          await gh(["api", `repos/${repo.repo}`], 15_000);
-          return repo;
-        } catch {
-          return null;
-        }
-      }),
-    );
-    return accessible.filter((repo): repo is RepoInfo => repo !== null);
   }
 
   // ------------------------------------------------------------------
@@ -1469,6 +1507,14 @@ export default async function plugin(bb: BbPluginApi) {
     return parsed.success ? parsed.data : emptyRepoHealth();
   }
 
+  function repoAccessWithheld(repo: string): boolean {
+    return getRepoHealth(repo).error === REPO_ACCESS_UNAVAILABLE;
+  }
+
+  function cachedAccessibleRepos(repos: RepoInfo[]): RepoInfo[] {
+    return repos.filter((entry) => !repoAccessWithheld(entry.repo));
+  }
+
   function setRepoHealth(repo: string, health: RepoHealth): void {
     db.prepare(
       `INSERT OR REPLACE INTO repo_sync_health
@@ -1594,9 +1640,28 @@ export default async function plugin(bb: BbPluginApi) {
   // ponytail: one global sync queue is enough for this single plugin process;
   // use per-account generations if concurrent full refresh throughput matters.
   let syncAllQueue: Promise<void> = Promise.resolve();
+  let syncDepth = 0;
+  type StatusPayload = {
+    ghOk: boolean;
+    ghState: GhState;
+    ghError: string | null;
+    repos: Array<z.infer<typeof repoStatusSchema>>;
+    lastSyncedAt: string | null;
+    syncing: boolean;
+  };
+  let statusInFlight: Promise<StatusPayload> | null = null;
   const reportedDependabotFailures = new Map<string, string>();
   function withSyncLock<T>(operation: () => Promise<T>): Promise<T> {
-    const result = syncAllQueue.then(operation);
+    const result = syncAllQueue.then(async () => {
+      const started = syncDepth === 0;
+      syncDepth += 1;
+      if (started) bb.realtime.publish("data-changed", { syncing: true });
+      try {
+        return await operation();
+      } finally {
+        syncDepth -= 1;
+      }
+    });
     syncAllQueue = result.then(() => undefined, () => undefined);
     return result;
   }
@@ -1620,6 +1685,7 @@ export default async function plugin(bb: BbPluginApi) {
     let itemsOk = false;
     let alertsOk = false;
     let retryable = false;
+    let accessRevoked = false;
     let items: CachedItem[] | null = null;
     let alerts: DependabotRow[] | null = null;
     const errors: string[] = [];
@@ -1629,29 +1695,37 @@ export default async function plugin(bb: BbPluginApi) {
       itemCount = items.length;
       itemsOk = true;
     } catch (error) {
+      if (isAbortError(error)) throw error;
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`items: ${message}`);
-      retryable = true;
+      if (isRepositoryAccessDenied(error)) {
+        accessRevoked = true;
+      } else {
+        retryable = true;
+      }
       bb.log.warn(`sync failed for ${repo}: ${message}`);
     }
 
-    try {
-      alerts = await fetchRepoDependabotAlerts(gh, repo);
-      alertCount = alerts.length;
-      alertsOk = true;
-      reportedDependabotFailures.delete(repo);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`Dependabot: ${message}`);
-      if (isKnownDependabotUnavailable(error)) {
-        if (reportedDependabotFailures.get(repo) !== message) {
-          bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
-          reportedDependabotFailures.set(repo, message);
-        }
-      } else {
+    if (!accessRevoked) {
+      try {
+        alerts = await fetchRepoDependabotAlerts(gh, repo);
+        alertCount = alerts.length;
+        alertsOk = true;
         reportedDependabotFailures.delete(repo);
-        retryable = true;
-        bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`Dependabot: ${message}`);
+        if (isKnownDependabotUnavailable(error)) {
+          if (reportedDependabotFailures.get(repo) !== message) {
+            bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+            reportedDependabotFailures.set(repo, message);
+          }
+        } else {
+          reportedDependabotFailures.delete(repo);
+          retryable = true;
+          bb.log.warn(`Dependabot sync failed for ${repo}: ${message}`);
+        }
       }
     }
 
@@ -1668,13 +1742,37 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
 
-    if (itemsOk && items !== null) replaceRepoRows(repo, items);
-    else clearCachedItems(repo);
+    if (accessRevoked) {
+      clearCachedItems(repo);
+      clearCachedDependabot(repo);
+      clearDependabotSyncError(repo);
+      setRepoHealth(repo, {
+        status: "failed",
+        lastAttemptAt: attemptAt,
+        lastSuccessAt: previous.lastSuccessAt,
+        itemCount: 0,
+        alertCount: 0,
+        error: REPO_ACCESS_UNAVAILABLE,
+      });
+      return {
+        items: 0,
+        itemsOk: false,
+        alertsOk: false,
+        retryable: false,
+        error: REPO_ACCESS_UNAVAILABLE,
+      };
+    }
+
+    if (itemsOk && items !== null) {
+      replaceRepoRows(repo, items);
+    } else {
+      itemCount = previous.itemCount;
+    }
     if (alertsOk && alerts !== null) {
       replaceRepoDependabotRows(repo, alerts);
       clearDependabotSyncError(repo);
     } else {
-      clearCachedDependabot(repo);
+      alertCount = previous.alertCount;
       if (errors.length > 0) {
         setDependabotSyncError(
           repo,
@@ -1786,6 +1884,7 @@ export default async function plugin(bb: BbPluginApi) {
     let incomplete = 0;
     let lastFailure = "";
     for (const { repo } of repos) {
+      if (abortSync?.aborted) throw abortError();
       const result = await syncRepository(repo, initialGeneration);
       if (result.skipped) continue;
       total += result.items;
@@ -1833,39 +1932,43 @@ export default async function plugin(bb: BbPluginApi) {
   // is a real fault and surfaces to the host unchanged.
   bb.background.service("sync", {
     async start(signal) {
+      abortSync = signal;
       let failures = 0;
-      while (!signal.aborted) {
-        let delayMs = SYNC_INTERVAL_MS;
-        try {
-          await syncAll();
-          failures = 0;
-        } catch (error) {
-          if (!isGhUnavailableError(error)) throw error;
-          failures += 1;
-          delayMs = Math.min(
-            SYNC_RETRY_BASE_MS * 2 ** (failures - 1),
-            SYNC_INTERVAL_MS,
-          );
-          bb.log.warn(
-            `sync failed (retry in ${Math.round(delayMs / 1000)}s): ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
+      try {
+        while (!signal.aborted) {
+          let delayMs = SYNC_INTERVAL_MS;
+          try {
+            await syncAll();
+            failures = 0;
+          } catch (error) {
+            if (signal.aborted || isAbortError(error)) break;
+            if (!isGhUnavailableError(error)) throw error;
+            failures += 1;
+            delayMs = Math.min(
+              SYNC_RETRY_BASE_MS * 2 ** (failures - 1),
+              SYNC_INTERVAL_MS,
+            );
+            bb.log.warn(
+              `sync failed (retry in ${Math.round(delayMs / 1000)}s): ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          if (signal.aborted) break;
+          await new Promise<void>((resolve) => {
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(() => {
+              signal.removeEventListener("abort", onAbort);
+              resolve();
+            }, delayMs);
+            signal.addEventListener("abort", onAbort, { once: true });
+          });
         }
-        // syncAll() can still be running when the host aborts the service.
-        // AbortSignal does not replay that event to a listener added later.
-        if (signal.aborted) break;
-        await new Promise<void>((resolve) => {
-          const onAbort = () => {
-            clearTimeout(timer);
-            resolve();
-          };
-          const timer = setTimeout(() => {
-            signal.removeEventListener("abort", onAbort);
-            resolve();
-          }, delayMs);
-          signal.addEventListener("abort", onAbort, { once: true });
-        });
+      } finally {
+        if (abortSync === signal) abortSync = null;
       }
     },
   });
@@ -2226,11 +2329,13 @@ export default async function plugin(bb: BbPluginApi) {
 
 
   async function getDependabotAlerts(input: { repos?: string[] }) {
-    const discovered = await discoverRepos(true);
+    const discovered = await discoverRepos();
     const authorized = input.repos !== undefined
       ? await Promise.all([...new Set(input.repos)].map((repo) => requireTrackedRepo(repo)))
-      : await accessibleTrackedRepos(discovered);
-    const repos = authorized.map(({ repo }) => repo);
+      : cachedAccessibleRepos(discovered);
+    const repos = authorized
+      .filter((entry) => !repoAccessWithheld(entry.repo))
+      .map(({ repo }) => repo);
     const alerts = listCachedDependabotAlerts(repos);
     return {
       alerts,
@@ -2245,39 +2350,32 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(githubRpcContract, {
     /** () → auth/sync status for the panel banner. */
     async status() {
-      // Re-probe on every status read so revoked credentials are reflected
-      // before any cached repository metadata is exposed.
-      try {
-        await checkAuth();
-      } catch {
-        // ghState/ghAuthError already carry the failure
-      }
-      const cursor = await bb.storage.kv.get<{
-        lastSyncedAt: string;
-        repos: number;
-        items: number;
-      }>("sync-cursor");
-      const repos = await discoverRepos(true);
-      const accessible = new Set(
-        (await accessibleTrackedRepos(repos)).map(({ repo }) => repo),
-      );
-      const safeStatuses = repos.map((repo) => accessible.has(repo.repo)
-        ? { ...repo, health: getRepoHealth(repo.repo) }
-        : {
-            ...repo,
-            health: {
-              ...emptyRepoHealth(),
-              status: "failed" as const,
-              error: "Repository access unavailable",
-            },
-          });
-      return {
-        ghOk: ghState === "ready",
-        ghState,
-        ghError: ghAuthError,
-        repos: safeStatuses,
-        lastSyncedAt: accessible.size === repos.length ? cursor?.lastSyncedAt ?? null : null,
-      };
+      if (statusInFlight !== null) return await statusInFlight;
+      statusInFlight = (async () => {
+        try {
+          await checkAuth();
+        } catch {
+          // ghState/ghAuthError already carry the failure
+        }
+        const cursor = await bb.storage.kv.get<{
+          lastSyncedAt: string;
+          repos: number;
+          items: number;
+        }>("sync-cursor");
+        const repos = await discoverRepos();
+        const withheld = repos.some((entry) => repoAccessWithheld(entry.repo));
+        return {
+          ghOk: ghState === "ready",
+          ghState,
+          ghError: ghAuthError,
+          repos: repos.map((repo) => ({ ...repo, health: getRepoHealth(repo.repo) })),
+          lastSyncedAt: withheld ? null : cursor?.lastSyncedAt ?? null,
+          syncing: syncDepth > 0,
+        };
+      })().finally(() => {
+        statusInFlight = null;
+      });
+      return await statusInFlight;
     },
 
     /** () → force a full sync now. */
@@ -2391,11 +2489,15 @@ export default async function plugin(bb: BbPluginApi) {
 
     /** { kind?, repo?, query?, state?, mine? } → cached items, newest first. */
     async listItems(input) {
-      const discovered = await discoverRepos(true);
+      const discovered = await discoverRepos();
       const authorized = input.repo !== undefined
         ? [await requireTrackedRepo(input.repo)]
-        : await accessibleTrackedRepos(discovered);
-      const repos = new Set(authorized.map(({ repo }) => repo));
+        : cachedAccessibleRepos(discovered);
+      const repos = new Set(
+        authorized
+          .filter((entry) => !repoAccessWithheld(entry.repo))
+          .map(({ repo }) => repo),
+      );
       return {
         items: listCachedItems({
           kind: input.kind,
@@ -2759,8 +2861,8 @@ export default async function plugin(bb: BbPluginApi) {
       } catch {
         // no environment / PR lookup failed — fall through to spawn links
       }
-      const repos = await discoverRepos(true);
-      const accessible = await accessibleTrackedRepos(repos);
+      const repos = await discoverRepos();
+      const accessible = cachedAccessibleRepos(repos);
       const links = await listAllLinks(new Set(accessible.map(({ repo }) => repo)));
       for (const threadLinks of Object.values(links)) {
         const link = threadLinks.find(
@@ -2831,8 +2933,8 @@ export default async function plugin(bb: BbPluginApi) {
 
     /** () → every issue/PR → thread link, keyed "<kind>:<repo>#<number>". */
     async listLinks() {
-      const repos = await discoverRepos(true);
-      const accessible = await accessibleTrackedRepos(repos);
+      const repos = await discoverRepos();
+      const accessible = cachedAccessibleRepos(repos);
       return { links: await listAllLinks(new Set(accessible.map(({ repo }) => repo))) };
     },
   });
@@ -2843,8 +2945,8 @@ export default async function plugin(bb: BbPluginApi) {
   // and falls back to the cache so a network blip doesn't block the send.
   // ------------------------------------------------------------------
   async function mentionItems(kind: "issue" | "pr", query: string) {
-    const discovered = await discoverRepos(true);
-    const repos = await accessibleTrackedRepos(discovered);
+    const discovered = await discoverRepos();
+    const repos = cachedAccessibleRepos(discovered);
     return listCachedItems({
       kind,
       query,
@@ -2980,8 +3082,8 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: USAGE };
         }
         if (sub === "repos") {
-          const discovered = await discoverRepos(true);
-          const repos = await accessibleTrackedRepos(discovered);
+          const discovered = await discoverRepos();
+          const repos = discovered;
           if (repos.length === 0) {
             return { exitCode: 0, stdout: "No tracked repos. Attach a project with a GitHub remote or set extraRepos." };
           }
@@ -2997,11 +3099,13 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
         if (sub === "issues" || sub === "prs") {
-          const discovered = await discoverRepos(true);
+          const discovered = await discoverRepos();
           const requestedRepo = arg === undefined ? undefined : canonicalRepoName(arg);
           const repos = requestedRepo !== undefined && requestedRepo !== null
-            ? [await requireTrackedRepo(requestedRepo)]
-            : await accessibleTrackedRepos(discovered);
+            ? [await requireTrackedRepo(requestedRepo)].filter(
+                (entry) => !repoAccessWithheld(entry.repo),
+              )
+            : cachedAccessibleRepos(discovered);
           const items = listCachedItems({
             kind: sub === "prs" ? "pr" : "issue",
             repo: requestedRepo ?? undefined,

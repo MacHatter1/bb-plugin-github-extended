@@ -146,6 +146,7 @@ export interface GithubStatus {
   ghError: string | null;
   repos: RepoStatus[];
   lastSyncedAt: string | null;
+  syncing: boolean;
 }
 
 const REPO_HEALTH_STATUSES: readonly RepoHealthStatus[] = [
@@ -155,6 +156,80 @@ const REPO_HEALTH_STATUSES: readonly RepoHealthStatus[] = [
   "partial",
   "failed",
 ];
+
+const REPO_HEALTH_RANK: Record<RepoHealthStatus, number> = {
+  healthy: 0,
+  never: 1,
+  partial: 2,
+  syncing: 3,
+  failed: 4,
+};
+
+export function repoHealthDotClass(status: RepoHealthStatus): string {
+  if (status === "healthy") return "bg-green-500";
+  if (status === "syncing") return "animate-pulse bg-yellow-500";
+  if (status === "failed") return "bg-red-500";
+  return "bg-muted-foreground/50";
+}
+
+export function worstRepoHealth(
+  statuses: readonly RepoHealthStatus[],
+): RepoHealthStatus | null {
+  if (statuses.length === 0) return null;
+  let worst: RepoHealthStatus = "healthy";
+  for (const status of statuses) {
+    if (REPO_HEALTH_RANK[status] > REPO_HEALTH_RANK[worst]) worst = status;
+  }
+  return worst;
+}
+
+const HEALTH_SUMMARY_LABELS: Array<[RepoHealthStatus, string]> = [
+  ["healthy", "healthy"],
+  ["partial", "partial"],
+  ["syncing", "syncing"],
+  ["failed", "failed"],
+  ["never", "not synced"],
+];
+
+export function summarizeRepoHealth(statuses: readonly RepoHealthStatus[]): string {
+  if (statuses.length === 0) return "not synced";
+  const counts: Record<RepoHealthStatus, number> = {
+    never: 0,
+    syncing: 0,
+    healthy: 0,
+    partial: 0,
+    failed: 0,
+  };
+  for (const status of statuses) counts[status] += 1;
+  return HEALTH_SUMMARY_LABELS.filter(([status]) => counts[status] > 0)
+    .map(([status, label]) => `${counts[status]} ${label}`)
+    .join(", ");
+}
+
+export type RepoHealthTone = "healthy" | "syncing" | "muted" | "failed";
+
+export function repoHealthColorCounts(
+  statuses: readonly RepoHealthStatus[],
+): Array<{ tone: RepoHealthTone; count: number }> {
+  let healthy = 0;
+  let syncing = 0;
+  let failed = 0;
+  let muted = 0;
+  for (const status of statuses) {
+    if (status === "healthy") healthy += 1;
+    else if (status === "syncing") syncing += 1;
+    else if (status === "failed") failed += 1;
+    else muted += 1;
+  }
+  return (
+    [
+      { tone: "healthy", count: healthy },
+      { tone: "syncing", count: syncing },
+      { tone: "muted", count: muted },
+      { tone: "failed", count: failed },
+    ] as const
+  ).filter((row) => row.count > 0);
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -231,6 +306,7 @@ export function normalizeStatus(value: unknown): GithubStatus | null {
     repos,
     lastSyncedAt:
       typeof raw.lastSyncedAt === "string" ? raw.lastSyncedAt : null,
+    syncing: raw.syncing === true,
   };
 }
 
