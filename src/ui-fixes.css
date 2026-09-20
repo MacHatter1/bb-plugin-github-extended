@@ -296,3 +296,23 @@
 :where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .cursor-pointer,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).cursor-pointer {
+  cursor: pointer;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .overflow-x-auto,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).overflow-x-auto {
+  overflow-x: auto;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .max-w-full,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).max-w-full {
+  max-width: 100%;
+}
+
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])) .disabled\:opacity-70:disabled,
+:where([data-bb-plugin="github-extended"], [data-bb-plugin-root]:not([data-bb-plugin])).disabled\:opacity-70:disabled {
+  opacity: 0.7;
+}

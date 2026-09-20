@@ -1,7 +1,7 @@
 {
   "name": "bb-plugin-github-extended",
-  "version": "0.1.2",
-  "description": "Browse GitHub issues, pull requests, and Dependabot alerts in BB.",
+  "version": "0.2.0",
+  "description": "Browse GitHub issues, pull requests, and Dependabot alerts, and automate pull-request workflows in BB.",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/MacHatter1/bb-plugin-github-extended#readme",
@@ -15,12 +15,15 @@
   },
   "bb": {
     "name": "GitHub Extended",
-    "description": "Browse GitHub issues, pull requests, and Dependabot alerts in BB.",
+    "description": "Browse GitHub issues, pull requests, and Dependabot alerts, and automate pull-request workflows in BB.",
     "branding": {
       "icon": "Github"
     },
     "server": "./src/server.ts",
-    "app": "./src/app.tsx"
+    "app": "./src/app.tsx",
+    "skills": [
+      "skills"
+    ]
   },
   "dependencies": {
     "zod": "^4.3.6"
@@ -36,6 +39,7 @@
     "dist",
     "src",
     "scripts",
+    "skills",
     "styles.css",
     "README.md",
     "tsconfig.json",
@@ -44,7 +48,9 @@
   "keywords": [
     "bb-plugin",
     "github",
-    "dependabot"
+    "dependabot",
+    "automation",
+    "pull-requests"
   ],
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.4.21",

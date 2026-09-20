@@ -230,6 +230,10 @@ describe("github plugin RPC behavior", () => {
       "bb github-extended issues [owner/repo]",
       "bb github-extended prs [owner/repo]",
       "bb github-extended sync",
+      "bb github-extended rules",
+      "bb github-extended jobs",
+      "bb github-extended poll",
+      "bb github-extended approve <job>",
     ]);
   });
 
