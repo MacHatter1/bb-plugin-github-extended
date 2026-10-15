@@ -17,6 +17,7 @@ let binDir: string;
 let partialFlag: string;
 let accessDeniedFlag: string;
 let dependabotDisabledFlag: string;
+let dependabotAlertFlag: string;
 let callLog: string;
 const originalPath = process.env.PATH;
 
@@ -30,6 +31,7 @@ beforeEach(() => {
   partialFlag = join(binDir, "gh-partial");
   accessDeniedFlag = join(binDir, "gh-access-denied");
   dependabotDisabledFlag = join(binDir, "gh-dependabot-disabled");
+  dependabotAlertFlag = join(binDir, "gh-dependabot-alert");
   callLog = join(binDir, "gh-calls.log");
   const openIssue = JSON.stringify([
     {
@@ -55,6 +57,22 @@ beforeEach(() => {
       url: "https://github.com/acme/widgets/pull/42",
       body: "Normalize every GitHub shape.",
       updatedAt: "2026-08-19T13:00:00Z",
+    },
+  ]);
+  const openDependabotAlert = JSON.stringify([
+    {
+      number: 3,
+      state: "open",
+      dependency: { package: { name: "widgets-core", ecosystem: "npm" } },
+      security_vulnerability: {
+        severity: "high",
+        vulnerable_version_range: "< 2.0.0",
+        first_patched_version: { identifier: "2.0.0" },
+      },
+      security_advisory: { summary: "A vulnerable dependency" },
+      html_url: "https://github.com/acme/widgets/security/dependabot/3",
+      created_at: "2026-08-19T10:00:00Z",
+      updated_at: "2026-08-19T11:00:00Z",
     },
   ]);
   const issueDetail = JSON.stringify({
@@ -185,7 +203,7 @@ case "$*" in
   "api repos/acme/widgets") printf '%s\\n' '{}';;
   "api repos/acme/widgets/assignees?per_page=100") printf '%s\n' '[{"login":"zoe"},{"login":"alice"},{"login":""}]';;
   "api repos/acme/widgets/labels?per_page=100") printf '%s\n' '[{"name":"triage"},{"name":" bug "},{"name":""}]';;
-  "api --paginate --jq .[] repos/acme/widgets/dependabot/alerts?state=open&per_page=100") if [ -e "${dependabotDisabledFlag}" ]; then echo "gh: Dependabot alerts are disabled for this repository. (HTTP 403)" >&2; exit 1; else printf '%s\n' '[]'; fi;;
+  "api --paginate --jq .[] repos/acme/widgets/dependabot/alerts?state=open&per_page=100") if [ -e "${dependabotDisabledFlag}" ]; then echo "gh: Dependabot alerts are disabled for this repository. (HTTP 403)" >&2; exit 1; elif [ -e "${dependabotAlertFlag}" ]; then printf '%s\n' '${openDependabotAlert}'; else printf '%s\n' '[]'; fi;;
   "issue list -R acme/widgets --state open"*) printf '%s\n' '${openIssue}';;
   "issue list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
   "issue list -R other/repo --state open"*) if [ -e "${partialFlag}" ]; then echo "partial sync failure" >&2; exit 1; else printf '%s\\n' '[]'; fi;;
@@ -312,6 +330,42 @@ describe("github plugin RPC behavior", () => {
         (signal) => signal.channel === "data-changed",
       ),
     ).toHaveLength(3);
+  });
+
+  it("returns open issue, pull request, and Dependabot alert counts in one summary", async () => {
+    writeFileSync(dependabotAlertFlag, "");
+    const { harness } = await loadPlugin();
+    await harness.callRpc("refresh");
+
+    await expect(harness.callRpc("listRepositorySummaries", null)).resolves.toEqual({
+      repos: [{
+        repo: "acme/widgets",
+        issueCount: 1,
+        pullRequestCount: 1,
+        alertCount: 1,
+      }],
+    });
+  });
+
+  it("returns issue and pull request counts when Dependabot access is missing", async () => {
+    writeFileSync(dependabotDisabledFlag, "");
+    const { harness } = await loadPlugin();
+    await harness.callRpc("refresh");
+    const dependabotCallsBeforeSummary = ghCalls().filter((call) =>
+      call.includes("dependabot/alerts"),
+    ).length;
+
+    await expect(harness.callRpc("listRepositorySummaries", null)).resolves.toEqual({
+      repos: [{
+        repo: "acme/widgets",
+        issueCount: 1,
+        pullRequestCount: 1,
+        alertCount: 0,
+      }],
+    });
+    expect(
+      ghCalls().filter((call) => call.includes("dependabot/alerts")),
+    ).toHaveLength(dependabotCallsBeforeSummary);
   });
 
   it("settles the background service without retrying known Dependabot limits", async () => {

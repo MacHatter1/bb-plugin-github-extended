@@ -55,11 +55,11 @@ available to the plugin. Creating issues, posting comments, changing state,
 assigning users, and changing labels require the matching GitHub permissions.
 
 Dependabot alerts are a separate GitHub capability. Alerts must be enabled for
-each repository, and GitHub may require the `admin:repo_hook` scope. If `gh`
-reports that scope, refresh it with:
+each repository. GitHub CLI credentials need the `security_events` scope to
+read alerts. If the alerts endpoint reports a missing scope, refresh it with:
 
 ```sh
-gh auth refresh -h github.com -s admin:repo_hook
+gh auth refresh -h github.com -s security_events
 ```
 
 For repository discovery, the server reads the `origin` remote from local BB
@@ -303,8 +303,8 @@ bb github-extended sync
 ### Dependabot shows a permission or disabled-alert error
 
 Dependabot alerts are controlled by GitHub per repository. Enable Dependabot
-alerts where appropriate. If the error requests the `admin:repo_hook` scope,
-run `gh auth refresh -h github.com -s admin:repo_hook`, then reload or
+alerts where appropriate. If the error reports a missing `security_events`
+scope, run `gh auth refresh -h github.com -s security_events`, then reload or
 synchronize the plugin after changing access.
 
 ### Inspect plugin logs

@@ -12,6 +12,7 @@ import {
   buildSuggestions,
   isSafeExternalUrl,
   matchesQuery,
+  normalizeRepositoryReference,
   normalizeStatus,
   parseQuery,
   parseSubPath,
@@ -34,6 +35,7 @@ import {
 import type {
   DependabotAlert,
   DependabotAlertDetail,
+  RepositorySummary,
   githubRpcContract,
 } from "./server.js";
 import {
@@ -3320,11 +3322,17 @@ function AddRepositoryForm() {
   const rpc = useRpc<typeof githubRpcContract>();
   const [value, setValue] = useState("");
   const [adding, setAdding] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
   const submit = useCallback(
     (event: React.SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
-      const repo = value.trim();
-      if (repo.length === 0 || adding) return;
+      const repo = normalizeRepositoryReference(value);
+      if (adding) return;
+      if (repo === null) {
+        setInputError("Enter owner/repository or paste a GitHub repository URL.");
+        return;
+      }
+      setInputError(null);
       setAdding(true);
       rpc
         .call("addRepository", { repo })
@@ -3332,7 +3340,14 @@ function AddRepositoryForm() {
           toast.success("Added " + repo);
           setValue("");
         })
-        .catch((error: unknown) => toast.error(errorText(error)))
+        .catch((error: unknown) => {
+          const message = errorText(error);
+          if (/rpc input validation failed/i.test(message)) {
+            setInputError("Repository input was rejected. Use owner/repository or a GitHub repository URL.");
+            return;
+          }
+          toast.error(message);
+        })
         .finally(() => setAdding(false));
     },
     [rpc, value, adding],
@@ -3348,12 +3363,22 @@ function AddRepositoryForm() {
       <Input
         id="github-add-repository"
         value={value}
-        onChange={(event) => setValue(event.target.value)}
-        placeholder="Add owner/repository"
+        onChange={(event) => {
+          setValue(event.target.value);
+          setInputError(null);
+        }}
+        placeholder="Add owner/repository or GitHub URL"
         autoComplete="off"
         disabled={adding}
+        aria-invalid={inputError !== null}
+        aria-describedby={inputError !== null ? "github-add-repository-error" : undefined}
         className="h-9"
       />
+      {inputError !== null ? (
+        <p id="github-add-repository-error" role="alert" className="text-xs text-red-600 dark:text-red-400 @[48rem]:self-center">
+          {inputError}
+        </p>
+      ) : null}
       <Button size="sm" type="submit" className="h-9 gap-1.5 @[48rem]:shrink-0" disabled={adding || value.trim().length === 0} aria-busy={adding}>
         {adding ? <Spinner className="size-3" /> : null}
         {adding ? "Adding…" : "Add"}
@@ -3371,13 +3396,19 @@ function RepositoryManager({
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const [busy, setBusy] = useState<string | null>(null);
-  const [summary, setSummary] = useState<{
-    items: Item[];
-    alerts: DependabotAlert[];
-  } | null>(null);
+  const [summaries, setSummaries] = useState<RepositorySummary[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [repoSearch, setRepoSearch] = useState("");
   const requestRef = useRef(0);
+  const summariesByRepo = useMemo(
+    () => new Map((summaries ?? []).map((summary) => [summary.repo, summary])),
+    [summaries],
+  );
+  const normalizedRepoSearch = repoSearch.trim().toLowerCase();
+  const visibleRepos = status.repos.filter((entry) =>
+    entry.repo.toLowerCase().includes(normalizedRepoSearch),
+  );
   const reposKey = status.repos.map((entry) => entry.repo).join("\u0000");
   const activeReposKey = useRef(reposKey);
   activeReposKey.current = reposKey;
@@ -3389,34 +3420,30 @@ function RepositoryManager({
     const requestKey = reposKey;
     const repos = repoEntriesRef.current.map((entry) => entry.repo);
     if (repos.length === 0) {
-      setSummary({ items: [], alerts: [] });
+      setSummaries([]);
       setLoadError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
-    Promise.all([
-      rpc.call("listItems", {}),
-      rpc.call("listDependabotAlerts", { repos }),
-    ]).then(
-      ([itemsResult, alertsResult]) => {
-        if (requestId !== requestRef.current || requestKey !== activeReposKey.current) return;
-        setSummary({
-          items: asItems(itemsResult),
-          alerts: Array.isArray((alertsResult as { alerts?: unknown })?.alerts)
-            ? ((alertsResult as { alerts: DependabotAlert[] }).alerts)
-            : [],
-        });
-        setLoadError(null);
-        setLoading(false);
-      },
-      (reason: unknown) => {
-        if (requestId === requestRef.current && requestKey === activeReposKey.current) {
-          setLoadError(errorText(reason));
-          setLoading(false);
-        }
-      },
-    );
+    const isCurrentRequest = () =>
+      requestId === requestRef.current && requestKey === activeReposKey.current;
+
+    void Promise.resolve()
+      .then(() => rpc.call("listRepositorySummaries", null))
+      .then(
+        ({ repos: result }) => {
+          if (!isCurrentRequest()) return;
+          setSummaries(result);
+          setLoadError(null);
+        },
+        (reason: unknown) => {
+          if (isCurrentRequest()) setLoadError(errorText(reason));
+        },
+      )
+      .finally(() => {
+        if (isCurrentRequest()) setLoading(false);
+      });
   }, [rpc, reposKey]);
 
   useEffect(() => {
@@ -3441,7 +3468,7 @@ function RepositoryManager({
 
   return (
     <div aria-busy={loading || busy !== null}>
-      {loading && summary !== null ? (
+      {loading && summaries !== null ? (
         <>
           <span className="sr-only">Updating repositories</span>
           <RefreshBar visible />
@@ -3449,10 +3476,26 @@ function RepositoryManager({
       ) : null}
       {loadError !== null ? (
         <EmptyState
-          title="Couldn't load repository details"
-          message={`Could not load repository details: ${loadError}`}
+          title="Couldn't load repository counts"
+          message={`Could not load repository counts: ${loadError}`}
           onRetry={load}
         />
+      ) : null}
+      {status.repos.length > 0 ? (
+        <div className="relative border-b border-border px-4 py-3">
+          <label htmlFor="github-tracked-repository-search" className="sr-only">
+            Search tracked repositories
+          </label>
+          <SearchIcon className="pointer-events-none absolute left-7 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            id="github-tracked-repository-search"
+            value={repoSearch}
+            onChange={(event) => setRepoSearch(event.target.value)}
+            placeholder="Search tracked repositories"
+            autoComplete="off"
+            className="h-9 pl-9"
+          />
+        </div>
       ) : null}
       {status.repos.length === 0 ? (
         <p className="px-4 py-3 text-sm text-muted-foreground">
@@ -3460,12 +3503,27 @@ function RepositoryManager({
         </p>
       ) : (
         <div className="divide-y divide-border">
-          {status.repos.map((entry) => {
+          {visibleRepos.length === 0 ? (
+            <div className="flex items-center justify-between gap-3 px-4 py-3" role="status">
+              <p className="text-sm text-muted-foreground">
+                No tracked repositories match “{repoSearch.trim()}”.
+              </p>
+              <Button size="sm" variant="ghost" className="h-8 shrink-0" onClick={() => setRepoSearch("")}>
+                Clear search
+              </Button>
+            </div>
+          ) : visibleRepos.map((entry) => {
             const health = entry.health;
-            const items = summary?.items.filter((item) => item.repo === entry.repo) ?? [];
-            const alertCount = summary === null
+            const summary = summariesByRepo.get(entry.repo);
+            const alertCount = summaries === null
               ? health.alertCount
-              : summary.alerts.filter((alert) => alert.repo === entry.repo && alert.state.toLowerCase() === "open").length;
+              : summary?.alertCount ?? 0;
+            const issueCount = summaries === null
+              ? null
+              : summary?.issueCount ?? 0;
+            const pullRequestCount = summaries === null
+              ? null
+              : summary?.pullRequestCount ?? 0;
             const dot = repoHealthDotClass(health.status);
             const dependabotError = health.error !== null && health.error.startsWith("Dependabot:")
               ? health.error
@@ -3491,10 +3549,14 @@ function RepositoryManager({
                   ) : null}
                 </div>
                 <div className="flex flex-wrap gap-2 @[48rem]:flex-nowrap">
-                  {[[items.filter((item) => item.kind === "issue" && item.state === "OPEN").length, "Issues"], [items.filter((item) => item.kind === "pr" && (item.state === "OPEN" || item.state === "DRAFT")).length, "PRs"], [alertCount, "Alerts"]].map(([count, label]) => (
+                  {[
+                    { count: issueCount, label: "Issues", countLoading: loading },
+                    { count: pullRequestCount, label: "PRs", countLoading: loading },
+                    { count: alertCount, label: "Alerts", countLoading: loading },
+                  ].map(({ count, label, countLoading }) => (
                     <div key={label} className="min-w-0 flex-1 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
                       <span className="block text-sm font-medium text-foreground">
-                        {summary === null ? (loading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
+                        {count === null ? (countLoading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
                       </span>
                       <span className="block truncate text-[11px] text-muted-foreground">{label}</span>
                     </div>
@@ -3655,7 +3717,7 @@ function DependabotSyncErrorNotice({
   compact?: boolean;
 }) {
   const alertsDisabled = /Dependabot alerts are disabled/i.test(message);
-  const missingScope = /admin:repo_hook/i.test(message);
+  const missingScope = !alertsDisabled && /admin:repo_hook|security_events|delete_repo/i.test(message);
   const hasKnownCause = alertsDisabled || missingScope;
 
   return (
@@ -3682,8 +3744,8 @@ function DependabotSyncErrorNotice({
         <div className={compact ? "mt-1" : "mt-2"}>
           <p className="text-muted-foreground">
             {compact
-              ? "Refresh the GitHub CLI token with this command:"
-              : <>GitHub also reports that your CLI token needs the <code className="font-mono text-[11px]">admin:repo_hook</code> scope. Refresh it with:</>}
+              ? "Dependabot alert access needs the security_events scope. Refresh the GitHub CLI token with:"
+              : <>Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope. Refresh the GitHub CLI token with:</>}
           </p>
           <code
             className={
@@ -3692,7 +3754,7 @@ function DependabotSyncErrorNotice({
                 : "mt-2 block overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs text-foreground"
             }
           >
-            gh auth refresh -h github.com -s admin:repo_hook
+            gh auth refresh -h github.com -s security_events
           </code>
         </div>
       ) : null}
@@ -3701,12 +3763,14 @@ function DependabotSyncErrorNotice({
           GitHub returned an error while loading alerts. See technical details below.
         </p>
       ) : null}
-      <details className={compact ? "mt-1 text-xs text-muted-foreground" : "mt-2 text-xs text-muted-foreground"}>
-        <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
-        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
-          {message}
-        </pre>
-      </details>
+      {!hasKnownCause ? (
+        <details className={compact ? "mt-1 text-xs text-muted-foreground" : "mt-2 text-xs text-muted-foreground"}>
+          <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
+            {message}
+          </pre>
+        </details>
+      ) : null}
     </div>
   );
 }

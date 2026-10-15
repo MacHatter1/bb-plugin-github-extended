@@ -59,6 +59,14 @@ const repoHealthSchema = z
 const repoStatusSchema = repoInfoSchema
   .extend({ health: repoHealthSchema })
   .strict();
+const repositorySummarySchema = z
+  .object({
+    repo: repoNameSchema,
+    issueCount: z.number().int().nonnegative(),
+    pullRequestCount: z.number().int().nonnegative(),
+    alertCount: z.number().int().nonnegative(),
+  })
+  .strict();
 
 const dependabotAlertSchema = z
   .object({
@@ -265,6 +273,10 @@ export const githubRpcContract = defineRpcContract({
   addRepository: {
     input: z.object({ repo: repoNameSchema }).strict(),
     output: okResultSchema,
+  },
+  listRepositorySummaries: {
+    input: z.null(),
+    output: z.object({ repos: z.array(repositorySummarySchema) }).strict(),
   },
   listDependabotAlerts: {
     input: z.object({ repos: z.array(repoNameSchema).optional() }).strict(),
@@ -477,7 +489,7 @@ function isTransientGithubError(error: unknown): boolean {
 
 function isKnownDependabotUnavailable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /Dependabot alerts are disabled|admin:repo_hook/i.test(message);
+  return /Dependabot alerts are disabled|admin:repo_hook|security_events|delete_repo/i.test(message);
 }
 
 /** Lost repo access (404 / explicit deny), not a blip, rate limit, SSO prompt,
@@ -800,6 +812,7 @@ export async function fetchRepoItems(
 
 export type DependabotAlert = z.infer<typeof dependabotAlertSchema>;
 export type DependabotAlertDetail = z.infer<typeof dependabotAlertDetailSchema>;
+export type RepositorySummary = z.infer<typeof repositorySummarySchema>;
 type DependabotRow = { alert: DependabotAlert; raw: string };
 
 function dependabotRecord(value: unknown): Record<string, unknown> {
@@ -1617,6 +1630,50 @@ export default async function plugin(bb: BbPluginApi) {
 
   function cachedAccessibleRepos(repos: RepoInfo[]): RepoInfo[] {
     return repos.filter((entry) => !repoAccessWithheld(entry.repo));
+  }
+
+  function listCachedRepositorySummaries(repos: RepoInfo[]) {
+    const summaries = new Map(
+      repos.map(({ repo }) => [repo, {
+        repo,
+        issueCount: 0,
+        pullRequestCount: 0,
+        alertCount: 0,
+      }]),
+    );
+    const accessibleRepos = cachedAccessibleRepos(repos).map(({ repo }) => repo);
+    if (accessibleRepos.length === 0) return repos.map(({ repo }) => summaries.get(repo)!);
+
+    const placeholders = accessibleRepos.map(() => "?").join(",");
+    const itemRows = db
+      .prepare(
+        `SELECT repo, kind, COUNT(*) AS count
+         FROM items
+         WHERE state = 'OPEN' AND repo IN (${placeholders})
+         GROUP BY repo, kind`,
+      )
+      .all(...accessibleRepos) as Record<string, unknown>[];
+    for (const row of itemRows) {
+      const summary = summaries.get(String(row.repo));
+      if (summary === undefined) continue;
+      if (row.kind === "issue") summary.issueCount = Number(row.count);
+      if (row.kind === "pr") summary.pullRequestCount = Number(row.count);
+    }
+
+    const alertRows = db
+      .prepare(
+        `SELECT repo, COUNT(*) AS count
+         FROM dependabot_alerts
+         WHERE LOWER(state) = 'open' AND repo IN (${placeholders})
+         GROUP BY repo`,
+      )
+      .all(...accessibleRepos) as Record<string, unknown>[];
+    for (const row of alertRows) {
+      const summary = summaries.get(String(row.repo));
+      if (summary !== undefined) summary.alertCount = Number(row.count);
+    }
+
+    return repos.map(({ repo }) => summaries.get(repo)!);
   }
 
   function setRepoHealth(repo: string, health: RepoHealth): void {
@@ -2661,6 +2718,12 @@ export default async function plugin(bb: BbPluginApi) {
         bb.realtime.publish("data-changed", {});
         return { ok: true as const };
       });
+    },
+
+    /** () → cached issue, PR, and Dependabot counts for every tracked repo. */
+    async listRepositorySummaries() {
+      const repos = await discoverRepos();
+      return { repos: listCachedRepositorySummaries(repos) };
     },
 
     /** () → open Dependabot security alerts for tracked repos. */

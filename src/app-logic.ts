@@ -119,6 +119,41 @@ interface ParsedQuery {
   text: string[];
 }
 
+const REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$/;
+
+/** Normalize a GitHub repository name or URL to the owner/repository form used by RPC. */
+export function normalizeRepositoryReference(value: string): string | null {
+  const input = value.trim();
+  if (input.length === 0) return null;
+
+  let candidate = input;
+  const sshMatch = input.match(
+    /^(?:git@github\.com:|ssh:\/\/git@github\.com\/)(.+)$/i,
+  );
+  if (sshMatch !== null) {
+    candidate = sshMatch[1]!.replace(/\/+$/, "").replace(/\.git$/i, "");
+  } else if (/^(?:https?:\/\/|github\.com\/)/i.test(input)) {
+    let url: URL;
+    try {
+      url = new URL(/^github\.com\//i.test(input) ? `https://${input}` : input);
+    } catch {
+      return null;
+    }
+    if (
+      (url.protocol !== "https:" && url.protocol !== "http:") ||
+      url.hostname.toLowerCase() !== "github.com" ||
+      url.username.length > 0 ||
+      url.password.length > 0
+    ) {
+      return null;
+    }
+    candidate = url.pathname.replace(/\/+$/, "").replace(/\.git$/i, "").slice(1);
+  }
+
+  if (!REPOSITORY_NAME_PATTERN.test(candidate)) return null;
+  return candidate.toLowerCase();
+}
+
 function tokenizeQuery(query: string): string[] {
   return query.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
 }
