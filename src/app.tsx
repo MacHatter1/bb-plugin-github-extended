@@ -3495,6 +3495,9 @@ function RepositoryManager({
             autoComplete="off"
             className="h-9 pl-9"
           />
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            Search by owner or repository. Select a repository to filter this view.
+          </p>
         </div>
       ) : null}
       {status.repos.length === 0 ? (
@@ -3529,7 +3532,7 @@ function RepositoryManager({
               ? health.error
               : null;
             return (
-              <div key={entry.repo} className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex-row @[48rem]:items-center">
+              <div key={entry.repo} className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-accent/50 @[64rem]:flex-row @[64rem]:items-center">
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className={"size-2 shrink-0 rounded-full " + dot} title={repoHealthText(health)} aria-hidden="true" />
@@ -3548,17 +3551,17 @@ function RepositoryManager({
                     <p className="mt-1 truncate text-xs text-red-600 dark:text-red-400" title={health.error}>{health.error}</p>
                   ) : null}
                 </div>
-                <div className="flex flex-wrap gap-2 @[48rem]:flex-nowrap">
+                <div className="grid w-full max-w-[24rem] grid-cols-3 gap-2 @[64rem]:w-64 @[64rem]:max-w-none @[64rem]:shrink-0">
                   {[
                     { count: issueCount, label: "Issues", countLoading: loading },
                     { count: pullRequestCount, label: "PRs", countLoading: loading },
                     { count: alertCount, label: "Alerts", countLoading: loading },
                   ].map(({ count, label, countLoading }) => (
-                    <div key={label} className="min-w-0 flex-1 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
+                    <div key={label} className="min-w-0 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
                       <span className="block text-sm font-medium text-foreground">
                         {count === null ? (countLoading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
                       </span>
-                      <span className="block truncate text-[11px] text-muted-foreground">{label}</span>
+                      <span className="block whitespace-nowrap text-[11px] text-muted-foreground">{label}</span>
                     </div>
                   ))}
                 </div>
@@ -3610,11 +3613,6 @@ function RepoHealthDots({ status }: { status: Status | null }) {
               )
             }
           />
-          {group.count > 0 ? (
-            <span className="text-[11px] font-medium tabular-nums leading-none">
-              {group.count}
-            </span>
-          ) : null}
         </span>
       ))}
     </span>
@@ -3720,51 +3718,74 @@ function DependabotSyncErrorNotice({
   const missingScope = !alertsDisabled && /admin:repo_hook|security_events|delete_repo/i.test(message);
   const hasKnownCause = alertsDisabled || missingScope;
 
+  if (compact) {
+    return (
+      <details className="mt-1 text-xs">
+        <summary className="cursor-pointer text-red-700 underline decoration-dotted underline-offset-2 dark:text-red-300">
+          {alertsDisabled ? "Dependabot alerts unavailable" : "Dependabot alert access needs attention"}
+        </summary>
+        <div className="github-alert-error mt-1 rounded-md border px-2.5 py-2">
+          {alertsDisabled ? (
+            <p className="text-muted-foreground">Enable alerts in GitHub, then refresh this view.</p>
+          ) : missingScope ? (
+            <>
+              <p className="text-muted-foreground">
+                Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope.
+                Refresh the GitHub CLI token with:
+              </p>
+              <code className="mt-1 block max-w-full overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[11px] text-foreground">
+                gh auth refresh -h github.com -s security_events
+              </code>
+            </>
+          ) : (
+            <>
+              <p className="text-muted-foreground">GitHub returned an error while loading alerts.</p>
+              <details className="mt-1 text-muted-foreground">
+                <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
+                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
+                  {message}
+                </pre>
+              </details>
+            </>
+          )}
+        </div>
+      </details>
+    );
+  }
+
   return (
     <div
       role="alert"
-      className={
-        compact
-          ? "github-alert-error mt-1 rounded-md border px-2.5 py-2 text-xs"
-          : "github-alert-error rounded-lg border px-3 py-3 text-sm"
-      }
+      className="github-alert-error rounded-lg border px-3 py-3 text-sm"
     >
       <p className="font-medium text-foreground">
         {alertsDisabled ? "Dependabot alerts are unavailable" : "Could not sync Dependabot alerts"}
       </p>
-      {!compact ? <p className="mt-1 text-xs text-muted-foreground">{repo}</p> : null}
+      <p className="mt-1 text-xs text-muted-foreground">{repo}</p>
       {alertsDisabled ? (
-        <p className={compact ? "mt-1 text-muted-foreground" : "mt-2 text-muted-foreground"}>
-          {compact
-            ? "Enable them in GitHub, then refresh this view."
-            : "Dependabot alerts are disabled for this repository. Enable them in GitHub, then refresh this view."}
+        <p className="mt-2 text-muted-foreground">
+          Dependabot alerts are disabled for this repository. Enable them in GitHub, then refresh this view.
         </p>
       ) : null}
       {missingScope ? (
-        <div className={compact ? "mt-1" : "mt-2"}>
+        <div className="mt-2">
           <p className="text-muted-foreground">
-            {compact
-              ? "Dependabot alert access needs the security_events scope. Refresh the GitHub CLI token with:"
-              : <>Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope. Refresh the GitHub CLI token with:</>}
+            Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope. Refresh the GitHub CLI token with:
           </p>
           <code
-            className={
-              compact
-                ? "mt-1 block max-w-full overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[11px] text-foreground"
-                : "mt-2 block overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs text-foreground"
-            }
+            className="mt-2 block overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs text-foreground"
           >
             gh auth refresh -h github.com -s security_events
           </code>
         </div>
       ) : null}
       {!hasKnownCause ? (
-        <p className={compact ? "mt-1 text-muted-foreground" : "mt-2 text-muted-foreground"}>
+        <p className="mt-2 text-muted-foreground">
           GitHub returned an error while loading alerts. See technical details below.
         </p>
       ) : null}
       {!hasKnownCause ? (
-        <details className={compact ? "mt-1 text-xs text-muted-foreground" : "mt-2 text-xs text-muted-foreground"}>
+        <details className="mt-2 text-xs text-muted-foreground">
           <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
           <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
             {message}
@@ -4584,7 +4605,7 @@ function GithubPanelBody({
           <Button
             size="sm"
             variant={reposOpen ? "secondary" : "outline"}
-            className="h-8 gap-1.5"
+            className="h-auto min-h-8 max-w-full flex-wrap justify-start gap-x-2 gap-y-1 px-3 py-1.5 text-left"
             aria-expanded={reposOpen}
             aria-controls="github-repos-drawer"
             aria-busy={refreshing}
@@ -4608,7 +4629,14 @@ function GithubPanelBody({
           >
             {refreshing ? <Spinner className="size-3" /> : null}
             <RepoHealthDots status={status} />
-            {status === null ? "Repos" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
+            <span className="font-medium">
+              {status === null ? "Repositories" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
+            </span>
+            {status !== null && repoCount > 0 ? (
+              <span className="text-xs font-normal text-muted-foreground">
+                {repoHealthSummary(status)}
+              </span>
+            ) : null}
           </Button>
           {listTab === "issues" ? (
             <Button
