@@ -758,10 +758,30 @@ describe("github plugin RPC behavior", () => {
   });
 
   it("isolates review spawns and keeps GitHub titles out of trusted thread metadata", async () => {
+    const checkout = mkdtempSync(join(binDir, "review-checkout-"));
+    execFileSync("git", ["-C", checkout, "init", "-q"]);
+    execFileSync("git", [
+      "-C",
+      checkout,
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/acme/widgets.git",
+    ]);
     const { bb, harness } = createFakePluginHost({
       pluginId: "github",
-      settings: { extraRepos: "acme/widgets", defaultProject: "project-1" },
+      settings: { extraRepos: "" },
       sdk: {
+        projects: {
+          list: () => [{
+            id: "project-1",
+            sources: [{
+              type: "local_path",
+              path: checkout,
+              hostId: "host-1",
+            }],
+          }],
+        },
         threads: {
           spawn: (_args: unknown) => ({ id: "review-thread" }),
         },
@@ -800,6 +820,7 @@ describe("github plugin RPC behavior", () => {
     expect(String(request.prompt)).toContain("gh pr diff 42 -R acme/widgets");
     expect(request.environment).toEqual({
       type: "host",
+      hostId: "host-1",
       workspace: {
         type: "managed-worktree",
         baseBranch: { kind: "default" },

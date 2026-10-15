@@ -412,6 +412,9 @@ export const githubRpcContract = defineRpcContract({
 });
 
 type RepoInfo = z.infer<typeof repoInfoSchema>;
+interface DiscoveredRepoInfo extends RepoInfo {
+  hostId: string | null;
+}
 type CachedItem = z.infer<typeof itemSchema>;
 
 interface GhListEntry {
@@ -439,7 +442,7 @@ interface ThreadLink {
 
 interface BbProjectSummary {
   id: string;
-  sources?: Array<{ type: string; path: string }>;
+  sources?: Array<{ type: string; path: string; hostId?: string }>;
 }
 
 interface SpawnedThreadSummary {
@@ -1166,11 +1169,16 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------------
   // Repo discovery: BB project sources → git origin → owner/repo.
   // ------------------------------------------------------------------
-  let repoCache: { repos: RepoInfo[]; fetchedAt: number } | null = null;
-  let lastKnownProjectRepos: RepoInfo[] = [];
+  let repoCache: {
+    repos: DiscoveredRepoInfo[];
+    projectHostIds: Map<string, string>;
+    fetchedAt: number;
+  } | null = null;
+  let lastKnownProjectRepos: DiscoveredRepoInfo[] = [];
   /** Local checkout per project-discovered repo, for automation's checkout.update. */
   const repoCheckouts = new Map<string, string>();
   let automationEngine: AutomationEngine | null = null;
+  let lastKnownProjectHostIds = new Map<string, string>();
   let ignoredExtraRepos: string[] = [];
   let lastIgnoredExtraReposKey: string | null = null;
   const reportedDiscoveryFailures = new Map<string, string>();
@@ -1198,43 +1206,91 @@ export default async function plugin(bb: BbPluginApi) {
     repoCache = null;
   });
 
-  async function discoverReposUnsafe(force = false, cleanup = true): Promise<RepoInfo[]> {
+  async function discoverReposUnsafe(
+    force = false,
+    cleanup = true,
+  ): Promise<DiscoveredRepoInfo[]> {
     if (!force && repoCache !== null && Date.now() - repoCache.fetchedAt < 60_000) {
       return repoCache.repos;
     }
     const generation = discoveryGeneration;
     const previousRepos = repoCache?.repos.map(({ repo }) => repo) ?? null;
     const previousProjectRepos = lastKnownProjectRepos;
-    const byRepo = new Map<string, RepoInfo>();
+    const byRepo = new Map<string, DiscoveredRepoInfo>();
+    let projectListSucceeded = false;
+    let projectHostIds = lastKnownProjectHostIds;
     let projectDiscoveryOk = true;
     try {
       const projects = (await bb.sdk.projects.list()) as unknown as BbProjectSummary[];
+      projectListSucceeded = true;
+      projectHostIds = new Map();
       reportedDiscoveryFailures.delete("project-list");
+      const sourceProjects = new Map<
+        string,
+        { projectId: string; hostId: string | null }
+      >();
       for (const project of projects) {
         for (const source of project.sources ?? []) {
           if (source.type !== "local_path") continue;
+          const hostId = source.hostId?.trim() || null;
+          if (hostId !== null && !projectHostIds.has(project.id)) {
+            projectHostIds.set(project.id, hostId);
+          }
+          if (!sourceProjects.has(source.path)) {
+            sourceProjects.set(source.path, { projectId: project.id, hostId });
+          }
+        }
+      }
+      const sources = [...sourceProjects].map(([path, source]) => ({ path, ...source }));
+      const discoveredSources = new Array<{
+        path: string;
+        projectId: string;
+        hostId: string | null;
+        repo: string | null;
+      } | null>(sources.length);
+      let nextSource = 0;
+      const readProjectSource = async () => {
+        for (;;) {
+          const index = nextSource++;
+          if (index >= sources.length) return;
+          const { path, projectId, hostId } = sources[index]!;
           try {
             const { stdout } = await run(
               "git",
-              ["-C", source.path, "remote", "get-url", "origin"],
+              ["-C", path, "remote", "get-url", "origin"],
               5_000,
               abortSync ?? undefined,
             );
-            reportedDiscoveryFailures.delete(source.path);
-            const repo = parseGithubRemote(stdout);
-            if (repo !== null && !byRepo.has(repo)) {
-              byRepo.set(repo, { repo, projectId: project.id });
-              repoCheckouts.set(repo, source.path);
-            }
+            reportedDiscoveryFailures.delete(path);
+            discoveredSources[index] = {
+              path,
+              projectId,
+              hostId,
+              repo: parseGithubRemote(stdout),
+            };
           } catch (error) {
             if (isAbortError(error)) throw error;
             projectDiscoveryOk = false;
             const message = error instanceof Error ? error.message : String(error);
-            if (reportedDiscoveryFailures.get(source.path) !== message) {
+            if (reportedDiscoveryFailures.get(path) !== message) {
               bb.log.warn(`git remote discovery failed: ${message}`);
-              reportedDiscoveryFailures.set(source.path, message);
+              reportedDiscoveryFailures.set(path, message);
             }
+            discoveredSources[index] = null;
           }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(8, sources.length) }, () => readProjectSource()),
+      );
+      for (const source of discoveredSources) {
+        if (source?.repo !== null && source !== null && !byRepo.has(source.repo)) {
+          byRepo.set(source.repo, {
+            repo: source.repo,
+            projectId: source.projectId,
+            hostId: source.hostId,
+          });
+          repoCheckouts.set(source.repo, source.path);
         }
       }
     } catch (error) {
@@ -1267,7 +1323,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     for (const repo of parsedExtraRepos.repos) {
       if (!byRepo.has(repo)) {
-        byRepo.set(repo, { repo, projectId: null });
+        byRepo.set(repo, { repo, projectId: null, hostId: null });
       }
     }
     const repos = [...byRepo.values()];
@@ -1280,7 +1336,8 @@ export default async function plugin(bb: BbPluginApi) {
       return await discoverReposUnsafe(true, cleanup);
     }
     if (trackingChanged) discoveryGeneration += 1;
-    repoCache = { repos, fetchedAt: Date.now() };
+    if (projectListSucceeded) lastKnownProjectHostIds = projectHostIds;
+    repoCache = { repos, projectHostIds, fetchedAt: Date.now() };
     const cleanupGeneration = discoveryGeneration;
     if (cleanup && persistenceCleanup !== null) {
       try {
@@ -1299,7 +1356,10 @@ export default async function plugin(bb: BbPluginApi) {
     return repos;
   }
 
-  async function discoverRepos(force = false, cleanup = true): Promise<RepoInfo[]> {
+  async function discoverRepos(
+    force = false,
+    cleanup = true,
+  ): Promise<DiscoveredRepoInfo[]> {
     const result = discoveryQueue.then(() => discoverReposUnsafe(force, cleanup));
     discoveryQueue = result.then(() => undefined, () => undefined);
     return await result;
@@ -1309,7 +1369,7 @@ export default async function plugin(bb: BbPluginApi) {
     repo: string,
     checkAccess = false,
     cleanup = true,
-  ): Promise<RepoInfo> {
+  ): Promise<DiscoveredRepoInfo> {
     const canonical = canonicalRepoName(repo);
     if (canonical === null) throw new Error(`Invalid repository ${repo}`);
     const info = (await discoverRepos(true, cleanup)).find((entry) => entry.repo === canonical);
@@ -1323,7 +1383,10 @@ export default async function plugin(bb: BbPluginApi) {
     return repos.map(({ repo }) => repo).sort().join("\u0000");
   }
 
-  function assertTrackedRepoSnapshot(repo: string, expectedGeneration: number): RepoInfo {
+  function assertTrackedRepoSnapshot(
+    repo: string,
+    expectedGeneration: number,
+  ): DiscoveredRepoInfo {
     const info = repoCache?.repos.find((entry) => entry.repo === repo);
     if (expectedGeneration !== discoveryGeneration || info === undefined) {
       throw ghUnavailable("repository tracking changed during write; retry");
@@ -1334,7 +1397,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function prepareRepoWrite(
     repo: string,
     checkAccess = true,
-  ): Promise<{ info: RepoInfo; generation: number }> {
+  ): Promise<{ info: DiscoveredRepoInfo; generation: number }> {
     const info = await requireTrackedRepo(repo, checkAccess, false);
     return { info, generation: discoveryGeneration };
   }
@@ -1342,7 +1405,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function verifyRepoWrite(
     prepared: { info: RepoInfo; generation: number },
     checkAccess = true,
-  ): Promise<RepoInfo> {
+  ): Promise<DiscoveredRepoInfo> {
     const info = assertTrackedRepoSnapshot(prepared.info.repo, prepared.generation);
     if (checkAccess) await gh(["api", "repos/" + info.repo], 15_000);
     return assertTrackedRepoSnapshot(info.repo, prepared.generation);
@@ -2281,17 +2344,32 @@ export default async function plugin(bb: BbPluginApi) {
     // Review work must not touch the selected/default checkout. The SDK
     // has no read-only spawn mode, so isolate reviews in a managed worktree
     // and keep edits behind the host's accept-edits approval boundary.
+    const environment =
+      kind === "pr"
+        ? (() => {
+            const hostId =
+              tracked.hostId ??
+              repoCache?.projectHostIds.get(projectId) ??
+              lastKnownProjectHostIds.get(projectId) ??
+              null;
+            if (hostId === null) {
+              throw new Error(
+                `No host is available for BB project ${projectId}. Add a local checkout to the project and retry.`,
+              );
+            }
+            return {
+              type: "host" as const,
+              hostId,
+              workspace: {
+                type: "managed-worktree" as const,
+                baseBranch: { kind: "default" as const },
+              },
+            };
+          })()
+        : { type: "project-default" as const };
     const thread = (await bb.sdk.threads.spawn({
       projectId,
-      environment: kind === "pr"
-        ? {
-            type: "host",
-            workspace: {
-              type: "managed-worktree",
-              baseBranch: { kind: "default" },
-            },
-          }
-        : { type: "project-default" },
+      environment,
       title: `${ref}: ${kind === "pr" ? "Pull request review" : "Issue work"}`.slice(0, 120),
       prompt,
       permissionMode: "accept-edits",
@@ -2481,7 +2559,11 @@ export default async function plugin(bb: BbPluginApi) {
           ghOk: ghState === "ready",
           ghState,
           ghError: ghAuthError,
-          repos: repos.map((repo) => ({ ...repo, health: getRepoHealth(repo.repo) })),
+          repos: repos.map((repo) => ({
+            repo: repo.repo,
+            projectId: repo.projectId,
+            health: getRepoHealth(repo.repo),
+          })),
           lastSyncedAt: withheld ? null : cursor?.lastSyncedAt ?? null,
           syncing: syncDepth > 0,
         };
