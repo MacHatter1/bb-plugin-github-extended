@@ -12,13 +12,17 @@ import {
   buildSuggestions,
   isSafeExternalUrl,
   matchesQuery,
+  normalizeRepositoryReference,
   normalizeStatus,
   parseQuery,
   parseSubPath,
+  queryHasToken,
   repoHealthColorCounts,
   repoHealthDotClass,
   routeToSubPath,
   summarizeRepoHealth,
+  toggleQueryToken,
+  withoutPrefixedTokens,
   type GithubStatus,
   type Item,
   type RepoHealth,
@@ -31,6 +35,7 @@ import {
 import type {
   DependabotAlert,
   DependabotAlertDetail,
+  RepositorySummary,
   githubRpcContract,
 } from "./server.js";
 import {
@@ -78,6 +83,7 @@ import { Tabs, TabsList, TabsPanel, TabsTrigger } from "./shared-ui.js";
 import { Textarea } from "./shared-ui.js";
 import { EmptyState } from "@/components/empty-state";
 import { Markdown, SafeUrlLink } from "@/components/markdown-lite";
+import { AutomationDirective, AutomationView } from "./automation-view.js";
 
 interface IssueComment {
   author: string;
@@ -162,6 +168,34 @@ function asItems(result: unknown): Item[] {
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+function isRowControlTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest("button, a, input, textarea, select, [role='menu'], [role='listbox']") !== null
+  );
+}
+
+function submitCommentOnModEnter(
+  event: React.KeyboardEvent<HTMLTextAreaElement>,
+  submit: () => void,
+) {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    submit();
+  }
+}
+
+const STATE_FILTER_PREFIXES = ["is:", "state:"] as const;
+const ASSIGNEE_FILTER_PREFIXES = ["assignee:"] as const;
+const SEVERITY_FILTER_PREFIXES = ["severity:"] as const;
+const FIX_FILTER_PREFIXES = ["fix:", "has:"] as const;
 
 function relativeTime(iso: string): string {
   const then = Date.parse(iso);
@@ -454,6 +488,7 @@ function RefreshIcon({ className }: { className?: string }) {
 
 function stateDotClass(kind: "issue" | "pr", state: string): string {
   if (state === "OPEN") return "bg-green-500";
+  if (kind === "pr" && state === "DRAFT") return "bg-muted-foreground/60";
   if (kind === "pr" && state === "MERGED") return "bg-purple-500";
   if (kind === "pr") return "bg-red-500";
   return "bg-purple-500";
@@ -556,6 +591,77 @@ function FilterSuggestionIcon({ icon }: { icon: SuggestionIcon }) {
   return <Avatar login={icon.login} size="size-4" />;
 }
 
+function FilterChip({
+  label,
+  pressed,
+  onToggle,
+}: {
+  label: string;
+  pressed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      onClick={onToggle}
+      className={cn(
+        "h-7 cursor-pointer rounded-full border px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        pressed
+          ? "border-foreground/25 bg-secondary text-foreground"
+          : "border-border text-muted-foreground hover:bg-accent hover:text-foreground",
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+function FilterChips({
+  query,
+  onChange,
+  kind,
+}: {
+  query: string;
+  onChange: (query: string) => void;
+  kind: "issue" | "pr" | "dependabot";
+}) {
+  const chips =
+    kind === "dependabot"
+      ? [
+          { label: "Open", token: "is:open", exclusive: STATE_FILTER_PREFIXES },
+          { label: "Critical", token: "severity:critical", exclusive: SEVERITY_FILTER_PREFIXES },
+          { label: "High", token: "severity:high", exclusive: SEVERITY_FILTER_PREFIXES },
+          { label: "Has fix", token: "fix:yes", exclusive: FIX_FILTER_PREFIXES },
+          { label: "No fix", token: "fix:no", exclusive: FIX_FILTER_PREFIXES },
+        ]
+      : kind === "pr"
+        ? [
+            { label: "Open", token: "is:open", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Draft", token: "is:draft", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Merged", token: "is:merged", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Closed", token: "is:closed", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Assigned to me", token: "assignee:@me", exclusive: ASSIGNEE_FILTER_PREFIXES },
+          ]
+        : [
+            { label: "Open", token: "is:open", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Closed", token: "is:closed", exclusive: STATE_FILTER_PREFIXES },
+            { label: "Assigned to me", token: "assignee:@me", exclusive: ASSIGNEE_FILTER_PREFIXES },
+          ];
+  return (
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Quick filters">
+      {chips.map((chip) => (
+        <FilterChip
+          key={chip.token}
+          label={chip.label}
+          pressed={queryHasToken(query, chip.token)}
+          onToggle={() => onChange(toggleQueryToken(query, chip.token, chip.exclusive))}
+        />
+      ))}
+    </div>
+  );
+}
+
 function FilterBar({
   value,
   onChange,
@@ -601,6 +707,23 @@ function FilterBar({
     [token, vocab, kind, viewer],
   );
   const active = Math.min(highlight, Math.max(0, suggestions.length - 1));
+  const filterLabel =
+    kind === "dependabot"
+      ? "Filter alerts"
+      : kind === "pr"
+        ? "Filter pull requests"
+        : "Filter issues";
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+      event.preventDefault();
+      inputRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const syncCaret = () =>
     setCaret(inputRef.current?.selectionStart ?? value.length);
@@ -656,6 +779,8 @@ function FilterBar({
         onBlur={() => setOpen(false)}
         onKeyDown={onKeyDown}
         role="combobox"
+        aria-label={filterLabel}
+        aria-keyshortcuts="/"
         aria-autocomplete="list"
         aria-expanded={open && suggestions.length > 0}
         aria-controls={suggestionListId}
@@ -664,7 +789,7 @@ function FilterBar({
             ? `${suggestionListId}-option-${active}`
             : undefined
         }
-        placeholder={placeholder ?? "Filter — is:open assignee:@me label:bug, or plain text"}
+        placeholder={placeholder ?? "Filter by title, is:open, assignee:@me…"}
         className="flex h-9 w-full rounded-lg border border-input bg-transparent py-1 pl-9 pr-8 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         spellCheck={false}
         autoComplete="off"
@@ -681,7 +806,7 @@ function FilterBar({
           }}
           aria-label="Clear filter"
         >
-          ✕
+          ×
         </button>
       ) : null}
       {open && suggestions.length > 0 ? (
@@ -895,7 +1020,18 @@ function ItemRow({
   const busy = spawningKey === `${item.repo}#${item.number}`;
   return (
     <div
-      className="grid grid-cols-1 gap-y-2 px-3 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2.5"
+      className="grid cursor-pointer grid-cols-1 gap-y-2 px-3 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2.5"
+      onClick={(event) => {
+        if (isRowControlTarget(event.target)) return;
+        onOpen();
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
     >
       <span className="flex min-w-0 items-start gap-2.5 @[48rem]:order-2 @[48rem]:flex-1 @[48rem]:items-center">
         {item.author.length > 0 ? (
@@ -922,7 +1058,7 @@ function ItemRow({
           </button>
           <LabelChips
             labels={item.labels}
-            className="hidden shrink-0 @[60rem]:flex"
+            className="flex flex-wrap shrink-0"
           />
           <ThreadPills links={links} />
         </span>
@@ -1109,6 +1245,8 @@ function ItemsTable({
   hasFilter,
   onRetry,
   onClearFilter,
+  emptyActionLabel,
+  onEmptyAction,
   onOpenItem,
   page,
   pageCount,
@@ -1124,6 +1262,8 @@ function ItemsTable({
   hasFilter: boolean;
   onRetry: () => void;
   onClearFilter?: () => void;
+  emptyActionLabel?: string;
+  onEmptyAction?: () => void;
   onOpenItem: (repo: string, number: number) => void;
   page: number;
   pageCount: number;
@@ -1159,8 +1299,8 @@ function ItemsTable({
             ? `No ${noun} match this filter.`
             : `No ${noun} in the tracked repos.`
         }
-        actionLabel={hasFilter ? "Clear filter" : undefined}
-        onAction={hasFilter ? onClearFilter : undefined}
+        actionLabel={hasFilter ? "Clear filter" : emptyActionLabel}
+        onAction={hasFilter ? onClearFilter : onEmptyAction}
       />
     );
   } else {
@@ -1698,6 +1838,7 @@ function IssueDetailView({
             #{detail.number}
           </span>
         </h2>
+        <StateBadge kind="issue" state={detail.state} />
         <Button
           size="sm"
           className="gap-1.5"
@@ -1758,7 +1899,9 @@ function IssueDetailView({
             <Textarea
               value={comment}
               onChange={(event) => setComment(event.target.value)}
+              onKeyDown={(event) => submitCommentOnModEnter(event, postComment)}
               placeholder="Leave a comment…"
+              title="Press Ctrl or ⌘ + Enter to post"
               rows={3}
             />
             <div className="flex justify-end">
@@ -2244,7 +2387,9 @@ function PullCommentBox({
       <Textarea
         value={comment}
         onChange={(event) => setComment(event.target.value)}
+        onKeyDown={(event) => submitCommentOnModEnter(event, post)}
         placeholder="Leave a comment…"
+        title="Press Ctrl or ⌘ + Enter to post"
         rows={3}
       />
       <div className="flex justify-end">
@@ -2527,7 +2672,7 @@ function PullPickerList({
       </div>
     );
   }
-  const open = items.filter((item) => item.state === "OPEN");
+  const open = items.filter((item) => item.state === "OPEN" || item.state === "DRAFT");
   if (open.length === 0) {
     return (
       <EmptyState
@@ -3177,11 +3322,17 @@ function AddRepositoryForm() {
   const rpc = useRpc<typeof githubRpcContract>();
   const [value, setValue] = useState("");
   const [adding, setAdding] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
   const submit = useCallback(
     (event: React.SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
-      const repo = value.trim();
-      if (repo.length === 0 || adding) return;
+      const repo = normalizeRepositoryReference(value);
+      if (adding) return;
+      if (repo === null) {
+        setInputError("Enter owner/repository or paste a GitHub repository URL.");
+        return;
+      }
+      setInputError(null);
       setAdding(true);
       rpc
         .call("addRepository", { repo })
@@ -3189,7 +3340,14 @@ function AddRepositoryForm() {
           toast.success("Added " + repo);
           setValue("");
         })
-        .catch((error: unknown) => toast.error(errorText(error)))
+        .catch((error: unknown) => {
+          const message = errorText(error);
+          if (/rpc input validation failed/i.test(message)) {
+            setInputError("Repository input was rejected. Use owner/repository or a GitHub repository URL.");
+            return;
+          }
+          toast.error(message);
+        })
         .finally(() => setAdding(false));
     },
     [rpc, value, adding],
@@ -3205,12 +3363,22 @@ function AddRepositoryForm() {
       <Input
         id="github-add-repository"
         value={value}
-        onChange={(event) => setValue(event.target.value)}
-        placeholder="Add owner/repository"
+        onChange={(event) => {
+          setValue(event.target.value);
+          setInputError(null);
+        }}
+        placeholder="Add owner/repository or GitHub URL"
         autoComplete="off"
         disabled={adding}
+        aria-invalid={inputError !== null}
+        aria-describedby={inputError !== null ? "github-add-repository-error" : undefined}
         className="h-9"
       />
+      {inputError !== null ? (
+        <p id="github-add-repository-error" role="alert" className="text-xs text-red-600 dark:text-red-400 @[48rem]:self-center">
+          {inputError}
+        </p>
+      ) : null}
       <Button size="sm" type="submit" className="h-9 gap-1.5 @[48rem]:shrink-0" disabled={adding || value.trim().length === 0} aria-busy={adding}>
         {adding ? <Spinner className="size-3" /> : null}
         {adding ? "Adding…" : "Add"}
@@ -3228,13 +3396,19 @@ function RepositoryManager({
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const [busy, setBusy] = useState<string | null>(null);
-  const [summary, setSummary] = useState<{
-    items: Item[];
-    alerts: DependabotAlert[];
-  } | null>(null);
+  const [summaries, setSummaries] = useState<RepositorySummary[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [repoSearch, setRepoSearch] = useState("");
   const requestRef = useRef(0);
+  const summariesByRepo = useMemo(
+    () => new Map((summaries ?? []).map((summary) => [summary.repo, summary])),
+    [summaries],
+  );
+  const normalizedRepoSearch = repoSearch.trim().toLowerCase();
+  const visibleRepos = status.repos.filter((entry) =>
+    entry.repo.toLowerCase().includes(normalizedRepoSearch),
+  );
   const reposKey = status.repos.map((entry) => entry.repo).join("\u0000");
   const activeReposKey = useRef(reposKey);
   activeReposKey.current = reposKey;
@@ -3246,34 +3420,30 @@ function RepositoryManager({
     const requestKey = reposKey;
     const repos = repoEntriesRef.current.map((entry) => entry.repo);
     if (repos.length === 0) {
-      setSummary({ items: [], alerts: [] });
+      setSummaries([]);
       setLoadError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
-    Promise.all([
-      rpc.call("listItems", {}),
-      rpc.call("listDependabotAlerts", { repos }),
-    ]).then(
-      ([itemsResult, alertsResult]) => {
-        if (requestId !== requestRef.current || requestKey !== activeReposKey.current) return;
-        setSummary({
-          items: asItems(itemsResult),
-          alerts: Array.isArray((alertsResult as { alerts?: unknown })?.alerts)
-            ? ((alertsResult as { alerts: DependabotAlert[] }).alerts)
-            : [],
-        });
-        setLoadError(null);
-        setLoading(false);
-      },
-      (reason: unknown) => {
-        if (requestId === requestRef.current && requestKey === activeReposKey.current) {
-          setLoadError(errorText(reason));
-          setLoading(false);
-        }
-      },
-    );
+    const isCurrentRequest = () =>
+      requestId === requestRef.current && requestKey === activeReposKey.current;
+
+    void Promise.resolve()
+      .then(() => rpc.call("listRepositorySummaries", null))
+      .then(
+        ({ repos: result }) => {
+          if (!isCurrentRequest()) return;
+          setSummaries(result);
+          setLoadError(null);
+        },
+        (reason: unknown) => {
+          if (isCurrentRequest()) setLoadError(errorText(reason));
+        },
+      )
+      .finally(() => {
+        if (isCurrentRequest()) setLoading(false);
+      });
   }, [rpc, reposKey]);
 
   useEffect(() => {
@@ -3298,7 +3468,7 @@ function RepositoryManager({
 
   return (
     <div aria-busy={loading || busy !== null}>
-      {loading && summary !== null ? (
+      {loading && summaries !== null ? (
         <>
           <span className="sr-only">Updating repositories</span>
           <RefreshBar visible />
@@ -3306,10 +3476,29 @@ function RepositoryManager({
       ) : null}
       {loadError !== null ? (
         <EmptyState
-          title="Couldn't load repository details"
-          message={`Could not load repository details: ${loadError}`}
+          title="Couldn't load repository counts"
+          message={`Could not load repository counts: ${loadError}`}
           onRetry={load}
         />
+      ) : null}
+      {status.repos.length > 0 ? (
+        <div className="relative border-b border-border px-4 py-3">
+          <label htmlFor="github-tracked-repository-search" className="sr-only">
+            Search tracked repositories
+          </label>
+          <SearchIcon className="pointer-events-none absolute left-7 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            id="github-tracked-repository-search"
+            value={repoSearch}
+            onChange={(event) => setRepoSearch(event.target.value)}
+            placeholder="Search tracked repositories"
+            autoComplete="off"
+            className="h-9 pl-9"
+          />
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            Search by owner or repository. Select a repository to filter this view.
+          </p>
+        </div>
       ) : null}
       {status.repos.length === 0 ? (
         <p className="px-4 py-3 text-sm text-muted-foreground">
@@ -3317,18 +3506,33 @@ function RepositoryManager({
         </p>
       ) : (
         <div className="divide-y divide-border">
-          {status.repos.map((entry) => {
+          {visibleRepos.length === 0 ? (
+            <div className="flex items-center justify-between gap-3 px-4 py-3" role="status">
+              <p className="text-sm text-muted-foreground">
+                No tracked repositories match “{repoSearch.trim()}”.
+              </p>
+              <Button size="sm" variant="ghost" className="h-8 shrink-0" onClick={() => setRepoSearch("")}>
+                Clear search
+              </Button>
+            </div>
+          ) : visibleRepos.map((entry) => {
             const health = entry.health;
-            const items = summary?.items.filter((item) => item.repo === entry.repo) ?? [];
-            const alertCount = summary === null
+            const summary = summariesByRepo.get(entry.repo);
+            const alertCount = summaries === null
               ? health.alertCount
-              : summary.alerts.filter((alert) => alert.repo === entry.repo && alert.state.toLowerCase() === "open").length;
+              : summary?.alertCount ?? 0;
+            const issueCount = summaries === null
+              ? null
+              : summary?.issueCount ?? 0;
+            const pullRequestCount = summaries === null
+              ? null
+              : summary?.pullRequestCount ?? 0;
             const dot = repoHealthDotClass(health.status);
             const dependabotError = health.error !== null && health.error.startsWith("Dependabot:")
               ? health.error
               : null;
             return (
-              <div key={entry.repo} className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex-row @[48rem]:items-center">
+              <div key={entry.repo} className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-accent/50 @[64rem]:flex-row @[64rem]:items-center">
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className={"size-2 shrink-0 rounded-full " + dot} title={repoHealthText(health)} aria-hidden="true" />
@@ -3347,13 +3551,17 @@ function RepositoryManager({
                     <p className="mt-1 truncate text-xs text-red-600 dark:text-red-400" title={health.error}>{health.error}</p>
                   ) : null}
                 </div>
-                <div className="flex flex-wrap gap-2 @[48rem]:flex-nowrap">
-                  {[[items.filter((item) => item.kind === "issue" && item.state === "OPEN").length, "Issues"], [items.filter((item) => item.kind === "pr" && item.state === "OPEN").length, "PRs"], [alertCount, "Alerts"]].map(([count, label]) => (
-                    <div key={label} className="min-w-0 flex-1 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
+                <div className="grid w-full max-w-[24rem] grid-cols-3 gap-2 @[64rem]:w-64 @[64rem]:max-w-none @[64rem]:shrink-0">
+                  {[
+                    { count: issueCount, label: "Issues", countLoading: loading },
+                    { count: pullRequestCount, label: "PRs", countLoading: loading },
+                    { count: alertCount, label: "Alerts", countLoading: loading },
+                  ].map(({ count, label, countLoading }) => (
+                    <div key={label} className="min-w-0 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
                       <span className="block text-sm font-medium text-foreground">
-                        {summary === null ? (loading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
+                        {count === null ? (countLoading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
                       </span>
-                      <span className="block truncate text-[11px] text-muted-foreground">{label}</span>
+                      <span className="block whitespace-nowrap text-[11px] text-muted-foreground">{label}</span>
                     </div>
                   ))}
                 </div>
@@ -3405,11 +3613,6 @@ function RepoHealthDots({ status }: { status: Status | null }) {
               )
             }
           />
-          {group.count > 0 ? (
-            <span className="text-[11px] font-medium tabular-nums leading-none">
-              {group.count}
-            </span>
-          ) : null}
         </span>
       ))}
     </span>
@@ -3512,61 +3715,120 @@ function DependabotSyncErrorNotice({
   compact?: boolean;
 }) {
   const alertsDisabled = /Dependabot alerts are disabled/i.test(message);
-  const missingScope = /admin:repo_hook/i.test(message);
+  const missingScope = !alertsDisabled && /admin:repo_hook|security_events|delete_repo/i.test(message);
   const hasKnownCause = alertsDisabled || missingScope;
+
+  if (compact) {
+    return (
+      <details className="mt-1 text-xs">
+        <summary className="cursor-pointer text-red-700 underline decoration-dotted underline-offset-2 dark:text-red-300">
+          {alertsDisabled ? "Dependabot alerts unavailable" : "Dependabot alert access needs attention"}
+        </summary>
+        <div className="github-alert-error mt-1 rounded-md border px-2.5 py-2">
+          {alertsDisabled ? (
+            <p className="text-muted-foreground">Enable alerts in GitHub, then refresh this view.</p>
+          ) : missingScope ? (
+            <>
+              <p className="text-muted-foreground">
+                Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope.
+                Refresh the GitHub CLI token with:
+              </p>
+              <code className="mt-1 block max-w-full overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[11px] text-foreground">
+                gh auth refresh -h github.com -s security_events
+              </code>
+            </>
+          ) : (
+            <>
+              <p className="text-muted-foreground">GitHub returned an error while loading alerts.</p>
+              <details className="mt-1 text-muted-foreground">
+                <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
+                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
+                  {message}
+                </pre>
+              </details>
+            </>
+          )}
+        </div>
+      </details>
+    );
+  }
 
   return (
     <div
       role="alert"
-      className={
-        compact
-          ? "github-alert-error mt-1 rounded-md border px-2.5 py-2 text-xs"
-          : "github-alert-error rounded-lg border px-3 py-3 text-sm"
-      }
+      className="github-alert-error rounded-lg border px-3 py-3 text-sm"
     >
       <p className="font-medium text-foreground">
         {alertsDisabled ? "Dependabot alerts are unavailable" : "Could not sync Dependabot alerts"}
       </p>
-      {!compact ? <p className="mt-1 text-xs text-muted-foreground">{repo}</p> : null}
+      <p className="mt-1 text-xs text-muted-foreground">{repo}</p>
       {alertsDisabled ? (
-        <p className={compact ? "mt-1 text-muted-foreground" : "mt-2 text-muted-foreground"}>
-          {compact
-            ? "Enable them in GitHub, then refresh this view."
-            : "Dependabot alerts are disabled for this repository. Enable them in GitHub, then refresh this view."}
+        <p className="mt-2 text-muted-foreground">
+          Dependabot alerts are disabled for this repository. Enable them in GitHub, then refresh this view.
         </p>
       ) : null}
       {missingScope ? (
-        <div className={compact ? "mt-1" : "mt-2"}>
+        <div className="mt-2">
           <p className="text-muted-foreground">
-            {compact
-              ? "Refresh the GitHub CLI token with this command:"
-              : <>GitHub also reports that your CLI token needs the <code className="font-mono text-[11px]">admin:repo_hook</code> scope. Refresh it with:</>}
+            Dependabot alert access needs the <code className="font-mono text-[11px]">security_events</code> scope. Refresh the GitHub CLI token with:
           </p>
           <code
-            className={
-              compact
-                ? "mt-1 block max-w-full overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[11px] text-foreground"
-                : "mt-2 block overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs text-foreground"
-            }
+            className="mt-2 block overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background px-2.5 py-2 font-mono text-xs text-foreground"
           >
-            gh auth refresh -h github.com -s admin:repo_hook
+            gh auth refresh -h github.com -s security_events
           </code>
         </div>
       ) : null}
       {!hasKnownCause ? (
-        <p className={compact ? "mt-1 text-muted-foreground" : "mt-2 text-muted-foreground"}>
+        <p className="mt-2 text-muted-foreground">
           GitHub returned an error while loading alerts. See technical details below.
         </p>
       ) : null}
-      <details className={compact ? "mt-1 text-xs text-muted-foreground" : "mt-2 text-xs text-muted-foreground"}>
-        <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
-        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
-          {message}
-        </pre>
-      </details>
+      {!hasKnownCause ? (
+        <details className="mt-2 text-xs text-muted-foreground">
+          <summary className="cursor-pointer font-medium text-foreground">Technical details</summary>
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-[11px]">
+            {message}
+          </pre>
+        </details>
+      ) : null}
     </div>
   );
 }
+
+function DependabotStatCard({
+  label,
+  value,
+  pressed,
+  loading,
+  onClick,
+}: {
+  label: string;
+  value: number | undefined;
+  pressed: boolean;
+  loading: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      aria-label={label}
+      disabled={loading}
+      onClick={onClick}
+      className={cn(
+        "rounded-lg border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-70",
+        pressed ? "border-foreground/25 bg-secondary" : "border-border bg-card hover:bg-accent/50",
+      )}
+    >
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="text-lg font-semibold tabular-nums text-foreground">
+        {loading ? <Skeleton className="mt-1 h-6 w-10" /> : value}
+      </p>
+    </button>
+  );
+}
+
 function DependabotListView({
   query,
   setQuery,
@@ -3674,24 +3936,52 @@ function DependabotListView({
           items={null}
           repos={repos}
           kind="dependabot"
-          placeholder="Filter — repo:owner/name severity:high fix:yes, or plain text"
+          placeholder="Filter by package, repo:owner/name, severity:high…"
         />
+        <FilterChips query={query} onChange={setQuery} kind="dependabot" />
         <SavedViewsBar tab="dependabot" query={query} onChange={setQuery} />
       </div>
       <div className="github-stats-grid">
-        {[
-          ["Alerts", displayStats?.totalCount],
-          ["High / critical", displayStats?.highCriticalCount],
-          ["With fix", displayStats?.withFixCount],
-          ["No fix", displayStats?.withoutFixCount],
-        ].map(([label, value]) => (
-          <div key={String(label)} className="rounded-lg border border-border bg-card px-3 py-2">
-            <p className="text-xs text-muted-foreground">{label}</p>
-            <p className="text-lg font-semibold text-foreground">
-              {displayStats === null ? <Skeleton className="mt-1 h-6 w-10" /> : value}
-            </p>
-          </div>
-        ))}
+        <DependabotStatCard
+          label="Alerts"
+          value={displayStats?.totalCount}
+          loading={displayStats === null}
+          pressed={
+            !queryHasToken(query, "severity:high") &&
+            !queryHasToken(query, "severity:critical") &&
+            !queryHasToken(query, "fix:yes") &&
+            !queryHasToken(query, "fix:no")
+          }
+          onClick={() =>
+            setQuery(withoutPrefixedTokens(query, [...SEVERITY_FILTER_PREFIXES, ...FIX_FILTER_PREFIXES, ...STATE_FILTER_PREFIXES]))
+          }
+        />
+        <DependabotStatCard
+          label="High / critical"
+          value={displayStats?.highCriticalCount}
+          loading={displayStats === null}
+          pressed={queryHasToken(query, "severity:high") && queryHasToken(query, "severity:critical")}
+          onClick={() => {
+            const active =
+              queryHasToken(query, "severity:high") && queryHasToken(query, "severity:critical");
+            const base = withoutPrefixedTokens(query, SEVERITY_FILTER_PREFIXES);
+            setQuery(active ? base : `${base} severity:high severity:critical`.trim());
+          }}
+        />
+        <DependabotStatCard
+          label="With fix"
+          value={displayStats?.withFixCount}
+          loading={displayStats === null}
+          pressed={queryHasToken(query, "fix:yes")}
+          onClick={() => setQuery(toggleQueryToken(query, "fix:yes", FIX_FILTER_PREFIXES))}
+        />
+        <DependabotStatCard
+          label="No fix"
+          value={displayStats?.withoutFixCount}
+          loading={displayStats === null}
+          pressed={queryHasToken(query, "fix:no")}
+          onClick={() => setQuery(toggleQueryToken(query, "fix:no", FIX_FILTER_PREFIXES))}
+        />
       </div>
       {result?.errors.map((entry) => (
         <DependabotSyncErrorNotice key={entry.repo} {...entry} />
@@ -3747,7 +4037,11 @@ function DependabotListView({
             {pageAlerts.map((alert) => (
               <div
                 key={alert.repo + "#" + alert.number}
-                className="grid w-full grid-cols-1 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2"
+                className="grid w-full cursor-pointer grid-cols-1 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2"
+                onClick={(event) => {
+                  if (isRowControlTarget(event.target)) return;
+                  onOpenAlert(alert.repo, alert.number);
+                }}
               >
                 <span className="flex items-center gap-2 shrink-0 font-mono text-xs text-muted-foreground @[48rem]:order-1 @[48rem]:w-12">
                   <span className={"size-2 rounded-full " + (alert.state.toLowerCase() === "open" ? "bg-green-500" : "bg-muted-foreground/50")} aria-hidden="true" />
@@ -4093,12 +4387,14 @@ function ListView({
   setQuery,
   repos,
   onOpenItem,
+  onNewIssue,
 }: {
   kind: "issue" | "pr";
   query: string;
   setQuery: (query: string) => void;
   repos: RepoInfo[];
   onOpenItem: (repo: string, number: number) => void;
+  onNewIssue?: () => void;
 }) {
   const { items, error, loading, refetch } = useItems(kind);
   const viewer = useViewer();
@@ -4112,11 +4408,10 @@ function ListView({
   );
   const [page, setPage] = useState(0);
   const pageSize = 25;
-  const paginated = kind === "pr";
   useEffect(() => setPage(0), [kind, query, filtered?.length]);
-  const pageCount = !paginated || filtered === null ? 1 : Math.max(1, Math.ceil(filtered.length / pageSize));
-  const visiblePage = !paginated || filtered === null || filtered.length === 0 ? 0 : Math.min(page, pageCount - 1);
-  const pageItems = filtered === null || !paginated ? filtered : filtered.slice(visiblePage * pageSize, (visiblePage + 1) * pageSize);
+  const pageCount = filtered === null ? 1 : Math.max(1, Math.ceil(filtered.length / pageSize));
+  const visiblePage = filtered === null || filtered.length === 0 ? 0 : Math.min(page, pageCount - 1);
+  const pageItems = filtered === null ? filtered : filtered.slice(visiblePage * pageSize, (visiblePage + 1) * pageSize);
   return (
     <div className="flex flex-col gap-3">
       <div className="sticky top-0 z-10 flex flex-col gap-2 bg-background pb-1">
@@ -4127,6 +4422,7 @@ function ListView({
           repos={repos}
           kind={kind}
         />
+        <FilterChips query={query} onChange={setQuery} kind={kind} />
         <SavedViewsBar tab={kind === "pr" ? "pulls" : "issues"} query={query} onChange={setQuery} />
       </div>
       {filtered === null ? (
@@ -4157,12 +4453,14 @@ function ListView({
         hasFilter={query.trim().length > 0}
         onRetry={refetch}
         onClearFilter={() => setQuery("")}
+        emptyActionLabel={kind === "issue" && onNewIssue !== undefined ? "New issue" : undefined}
+        onEmptyAction={kind === "issue" ? onNewIssue : undefined}
         onOpenItem={onOpenItem}
         page={visiblePage}
         pageCount={pageCount}
         total={filtered?.length ?? 0}
         pageSize={pageSize}
-        showPagination={paginated}
+        showPagination
         onPageChange={setPage}
       />
     </div>
@@ -4273,7 +4571,9 @@ function GithubPanelBody({
       ? "pulls"
       : route.view === "dependabot"
         ? "dependabot"
-        : "issues";
+        : route.view === "automation"
+          ? "automation"
+          : "issues";
   const kind = listTab === "pulls" ? "pr" : "issue";
   const repoCount = status?.repos.length ?? 0;
   const refreshing = loading || status?.syncing === true;
@@ -4287,7 +4587,9 @@ function GithubPanelBody({
             ? { view: "pulls" }
             : value === "dependabot"
               ? { view: "dependabot" }
-              : { view: "issues" },
+              : value === "automation"
+                ? { view: "automation", page: "setup" }
+                : { view: "issues" },
         );
       }}
     >
@@ -4297,12 +4599,13 @@ function GithubPanelBody({
             <TabsTrigger value="issues">Issues</TabsTrigger>
             <TabsTrigger value="pulls">Pull requests</TabsTrigger>
             <TabsTrigger value="dependabot">Dependabot</TabsTrigger>
+            <TabsTrigger value="automation">Automation</TabsTrigger>
           </TabsList>
           <div className="flex-1" />
           <Button
             size="sm"
             variant={reposOpen ? "secondary" : "outline"}
-            className="h-8 gap-1.5"
+            className="h-auto min-h-8 max-w-full flex-wrap justify-start gap-x-2 gap-y-1 px-3 py-1.5 text-left"
             aria-expanded={reposOpen}
             aria-controls="github-repos-drawer"
             aria-busy={refreshing}
@@ -4326,10 +4629,23 @@ function GithubPanelBody({
           >
             {refreshing ? <Spinner className="size-3" /> : null}
             <RepoHealthDots status={status} />
-            {status === null ? "Repos" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
+            <span className="font-medium">
+              {status === null ? "Repositories" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
+            </span>
+            {status !== null && repoCount > 0 ? (
+              <span className="text-xs font-normal text-muted-foreground">
+                {repoHealthSummary(status)}
+              </span>
+            ) : null}
           </Button>
           {listTab === "issues" ? (
-            <Button size="sm" className="h-8" onClick={() => navigate({ view: "new" })}>
+            <Button
+              size="sm"
+              className="h-8"
+              disabled={repoCount === 0}
+              title={repoCount === 0 ? "Add a repository first" : undefined}
+              onClick={() => navigate({ view: "new" })}
+            >
               New issue
             </Button>
           ) : null}
@@ -4340,7 +4656,13 @@ function GithubPanelBody({
           </div>
         ) : null}
         <TabsPanel value={listTab}>
-          {listTab === "dependabot" ? (
+          {listTab === "automation" ? (
+            <AutomationView
+              status={status}
+              page={route.view === "automation" ? route.page : "setup"}
+              navigate={navigate}
+            />
+          ) : listTab === "dependabot" ? (
             <DependabotListView
               query={query}
               setQuery={setQuery}
@@ -4355,6 +4677,11 @@ function GithubPanelBody({
               repos={status?.repos ?? []}
               onOpenItem={(repo, number) =>
                 openItem(kind === "pr" ? "pr" : "issue", repo, number)
+              }
+              onNewIssue={
+                kind === "issue" && (status?.repos.length ?? 0) > 0
+                  ? () => navigate({ view: "new" })
+                  : undefined
               }
             />
           )}
@@ -4378,5 +4705,9 @@ export default definePluginApp((app) => {
     title: "GitHub+ PR",
     icon: "Github",
     component: PullPanelTab,
+  });
+  app.slots.messageDirective({
+    id: "github-automation",
+    component: AutomationDirective,
   });
 });

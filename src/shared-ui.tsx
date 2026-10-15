@@ -457,8 +457,8 @@ export function Tabs({ value, onValueChange, children }: { value: string; onValu
   const id = useId();
   return <TabsContext.Provider value={{ value, setValue: onValueChange, id }}><div>{children}</div></TabsContext.Provider>;
 }
-export function TabsList({ children }: { children: ReactNode }) {
-  return <div role="tablist" aria-label="GitHub views" className="inline-flex items-center gap-1 rounded-md bg-muted p-1">{children}</div>;
+export function TabsList({ children, className }: { children: ReactNode; className?: string }) {
+  return <div role="tablist" aria-label="GitHub views" className={cn("inline-flex max-w-full items-center gap-1 overflow-x-auto rounded-md bg-muted p-1", className)}>{children}</div>;
 }
 export function TabsTrigger({ value, children }: { value: string; children: ReactNode }) {
   const tabs = useContext(TabsContext);
@@ -472,5 +472,5 @@ export function TabsPanel({ value, children }: { value: string; children: ReactN
   const active = tabs?.value === value;
   const panelId = tabs === null ? undefined : `${tabs.id}-panel-${value}`;
   const tabId = tabs === null ? undefined : `${tabs.id}-tab-${value}`;
-  return <div id={panelId} role="tabpanel" aria-labelledby={tabId} hidden={!active} tabIndex={0}>{children}</div>;
+  return <div id={panelId} role="tabpanel" aria-labelledby={tabId} hidden={!active} tabIndex={0}>{active ? children : null}</div>;
 }

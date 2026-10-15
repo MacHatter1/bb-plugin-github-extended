@@ -25,6 +25,12 @@ if (manifest.bb?.app !== "./src/app.tsx" || manifest.bb?.server !== "./src/serve
 if (!manifest.files.includes("src") || manifest.files.some((entry) => entry.includes("recovery"))) {
   fail("package files must include src and exclude recovery references");
 }
+if (!manifest.files.includes("skills") || !Array.isArray(manifest.bb?.skills) || !manifest.bb.skills.includes("skills")) {
+  fail("package must ship the skills directory and declare it under bb.skills");
+}
+if (!existsSync(resolve(root, "skills/github-automation/SKILL.md"))) {
+  fail("skills/github-automation/SKILL.md is missing");
+}
 if (existsSync(resolve(root, "app.tsx"))) {
   fail("a root app.tsx wrapper must not be present");
 }
@@ -51,10 +57,10 @@ for (const [name, source] of [["src/app.tsx", sourceApp], ["src/app-logic.ts", s
     fail(`${name} must not import generated dist files`);
   }
 }
-for (const marker of ["definePluginApp", "Tracked repositories", "DependabotListView", "SavedViewsBar", "Files changed"]) {
+for (const marker of ["definePluginApp", "Tracked repositories", "DependabotListView", "SavedViewsBar", "Files changed", "AutomationView", "github-automation"]) {
   if (!sourceApp.includes(marker)) fail(`canonical app marker missing: ${marker}`);
 }
-for (const marker of ["parseSubPath", "dependabot-alert", "routeToSubPath"]) {
+for (const marker of ["parseSubPath", "dependabot-alert", "routeToSubPath", "automation"]) {
   if (!sourceLogic.includes(marker)) fail(`canonical app-logic marker missing: ${marker}`);
 }
 for (const marker of [
@@ -64,6 +70,8 @@ for (const marker of [
   "getDependabotAlert",
   "parseExtraRepos",
   "--active",
+  "createAutomationEngine",
+  "github_extended_create_rule",
 ]) {
   if (!sourceServer.includes(marker)) fail(`canonical server marker missing: ${marker}`);
 }
@@ -89,10 +97,10 @@ for (const artifact of ["app", "server"]) {
 const app = read("dist/app.js");
 const server = read("dist/server.js");
 const css = read("dist/app.css");
-for (const marker of ["Dependabot", "Tracked repositories", "Saved views", "Files changed", "Review with agent"]) {
+for (const marker of ["Dependabot", "Tracked repositories", "Saved views", "Files changed", "Review with agent", "Starter templates", "github-automation"]) {
   if (!app.includes(marker)) fail(`generated app marker missing: ${marker}`);
 }
-for (const marker of ["listDependabotAlerts", "getDependabotAlert", "repo_sync_health", "parseExtraRepos"]) {
+for (const marker of ["listDependabotAlerts", "getDependabotAlert", "repo_sync_health", "parseExtraRepos", "automationDashboard", "automation_jobs"]) {
   if (!server.includes(marker)) fail(`generated server marker missing: ${marker}`);
 }
 for (const marker of ["rounded-xl", "min-h-48", "resize-y", "text-red-500", "github-stats-grid", "github-severity-critical"]) {

@@ -1,7 +1,8 @@
 # GitHub Extended
 
 GitHub Extended adds a **GitHub+** panel to BB for working with GitHub issues,
-pull requests, Dependabot alerts, and agent threads from one workspace.
+pull requests, Dependabot alerts, pull-request automation, and agent threads
+from one workspace.
 
 The plugin is available as `github-extended` so it can coexist with BB's
 built-in `github` plugin without a CLI command collision.
@@ -18,6 +19,12 @@ built-in `github` plugin without a CLI command collision.
 - Link a pull request to an existing BB thread.
 - Use GitHub issues and pull requests as BB mention providers with `@` and `#`.
 - Refresh automatically every five minutes, with retry/backoff for transient failures.
+- Automate pull-request workflows: poll enabled repositories with `gh`, match
+  ordered rules against PR, review, CI, and base-branch events, and run
+  approval-gated actions such as agent reviews, GitHub comments and reviews,
+  labels, and fast-forward checkout updates. See [Automation](#automation).
+- Let agents create automation rules from chat with the
+  `github_extended_create_rule` tool and the bundled `github-automation` skill.
 
 ## Requirements
 
@@ -48,11 +55,11 @@ available to the plugin. Creating issues, posting comments, changing state,
 assigning users, and changing labels require the matching GitHub permissions.
 
 Dependabot alerts are a separate GitHub capability. Alerts must be enabled for
-each repository, and GitHub may require the `admin:repo_hook` scope. If `gh`
-reports that scope, refresh it with:
+each repository. GitHub CLI credentials need the `security_events` scope to
+read alerts. If the alerts endpoint reports a missing scope, refresh it with:
 
 ```sh
-gh auth refresh -h github.com -s admin:repo_hook
+gh auth refresh -h github.com -s security_events
 ```
 
 For repository discovery, the server reads the `origin` remote from local BB
@@ -60,10 +67,14 @@ project checkouts. It writes synchronized items, health, and thread links to
 the plugin's local SQLite cache. Cache contents are not sent to a separate
 telemetry service by the plugin.
 
-The five-minute background refresh is read-only. No agent thread is started and
-no GitHub mutation is performed automatically; agent work and GitHub writes
-begin only after the corresponding user action. The plugin has no delete-
-repository or destructive filesystem operation.
+The five-minute background refresh is read-only, and so is automation polling.
+No agent thread is started and no GitHub mutation is performed until a rule
+you enabled matches an event, the job is approved when the rule requires it,
+and the **Automation dry run** setting is turned off. The only local write an
+automation action can make is a fast-forward-only `git pull` of a repository's
+base branch in its attached BB project checkout, and only when a rule includes
+that action. The plugin has no delete-repository, fork-deletion, or other
+destructive filesystem operation.
 
 Starting work from an issue creates an agent thread in the attached BB project
 checkout, or in the configured default project, and that agent may edit files.
@@ -136,6 +147,97 @@ ignored and reported in the plugin log.
 tracked repository is not attached to a discovered BB project. Set it in the
 plugin settings before using the agent actions for those repositories.
 
+### Automation dry run
+
+`Automation dry run` is on by default. While it is on, matched automation jobs
+record what each action would have done instead of posting to GitHub, starting
+review threads, or updating checkouts. Turn it off only after reviewing the
+rules and jobs on the **Automation** tab.
+
+```sh
+bb plugin config github-extended set automationDryRun false
+```
+
+## Automation
+
+The **Automation** tab turns pull-request activity into approval-gated jobs
+without a webhook or public tunnel. Its pages are URL-backed
+(`automation`, `automation/rules`, `automation/events`, `automation/audit`,
+`automation/polling`).
+
+### Setup
+
+1. **Enable a repository.** Every tracked repository is listed on the Setup
+   page with an automation toggle and a base branch (default `main`). Only
+   enabled repositories are polled.
+2. **GitHub CLI.** Polling and GitHub actions use the same `gh` login as the
+   rest of the plugin.
+3. **Polling.** `gh pr list` runs for each enabled repository on a timer
+   (1 minute to 1 hour, default 5 minutes). The first poll of a repository
+   stores a baseline and does not replay existing pull requests.
+4. **Rules.** Enable a starter rule or build your own.
+
+### Events
+
+Each poll diffs the current pull requests and base-branch SHA against the
+stored snapshot and raises:
+
+`pr.opened`, `pr.synchronised` (new head commit), `pr.review_requested`,
+`pr.approved`, `pr.changes_requested`, `ci.success`, `ci.failure`,
+`pr.merged`, `pr.closed`, and `push.base` (the base branch SHA changed).
+
+Delivery ids are stable, so the same transition is never queued twice.
+
+### Rules
+
+A rule has a name, enabled state, order, one or more trigger events, an
+optional repository list (empty means every enabled repository), flat filters
+(base/head branch wildcards, actor, labels, draft, changed paths), condition
+groups (every group must match; rows within a group combine with AND or OR
+over base, head, actor, label, draft, path, event, and repository), and an
+ordered action list. Rules can also be edited as JSON.
+
+Actions:
+
+| Action | What it does | Parameter |
+| --- | --- | --- |
+| `bb.review` | Starts the same isolated GitHub+ review thread as **Review with agent**, links it to the PR, waits for the agent to go idle, and captures its output for later actions. | `reviewPrompt` (extra trusted instructions) |
+| `github.comment` | Posts a conversation comment on the PR. | `bodyTemplate` |
+| `github.review` | Posts a review comment on the PR. | `bodyTemplate` |
+| `github.label` | Adds a label to the PR (default `bb-automation`). | `label` |
+| `checkout.update` | Fast-forwards the base branch in the attached BB project checkout with `git pull --ff-only`; refuses if the checkout is on another branch. | `targetBranch` |
+
+Body templates accept `{{review}}`, `{{repo}}`, `{{owner}}`, `{{name}}`,
+`{{prNumber}}`, `{{title}}`, `{{event}}`, `{{base}}`, `{{head}}`, `{{actor}}`,
+and `{{sha}}`. Changed-path filters fetch the PR file list only when a rule
+uses them.
+
+### Jobs, approvals, and audit
+
+Every detected event becomes one durable job. The worker matches rules in
+order; a job that matches an approval-gated rule waits on the Events page
+until you approve it. Actions are keyed by job, rule, and position, so a
+replay never repeats a completed action. Failures retry up to three attempts
+before the job enters the dead-letter state, from which it can be replayed.
+Stale `running` jobs left behind by a restart can be requeued. Every poll,
+rule save, job transition, and action run is appended to the audit trail.
+
+### Quota
+
+The Polling page reads the GitHub GraphQL and REST quota through `gh`. Polling
+pauses automatically when GraphQL points remaining fall to the configured floor
+(default 100) and resumes after GitHub resets the hourly quota. `gh pr list
+--json` shares the signed-in user's 5,000 GraphQL points per hour with every
+other `gh` command on the machine, including the plugin's own sync.
+
+### Creating rules from chat
+
+Agents get the `github_extended_create_rule` tool and the `github-automation`
+skill. Ask for a rule in natural language; the tool creates it disabled and
+approval-gated for the repository attached to the current BB project (or an
+explicit `repo`), and the reply ends with a result card that opens the Rules
+page.
+
 ## CLI commands
 
 All list commands read the plugin's synchronized cache. Use `sync` to request a
@@ -146,14 +248,19 @@ bb github-extended repos               List tracked repositories
 bb github-extended issues [owner/repo]  List cached open issues
 bb github-extended prs [owner/repo]     List cached open pull requests
 bb github-extended sync                Refresh the cache from GitHub now
+bb github-extended rules               List automation rules
+bb github-extended jobs                List recent automation events and jobs
+bb github-extended poll                Poll GitHub for automation events now
+bb github-extended approve <job>       Approve a job waiting for approval
 ```
 
 ## Data and synchronization
 
 The server stores synchronized issue, pull request, Dependabot, health, and
-thread-link data in the plugin's local SQLite cache. The panel and mention
-providers read that cache so browsing does not require a GitHub request for
-every view.
+thread-link data in the plugin's local SQLite cache, alongside automation
+repositories, rules, poll snapshots, jobs, action runs, and the audit trail.
+The panel and mention providers read that cache so browsing does not require a
+GitHub request for every view.
 
 Actions that change GitHub data—such as creating an issue, posting a comment,
 changing state, assigning users, or changing labels—run through the GitHub CLI
@@ -196,8 +303,8 @@ bb github-extended sync
 ### Dependabot shows a permission or disabled-alert error
 
 Dependabot alerts are controlled by GitHub per repository. Enable Dependabot
-alerts where appropriate. If the error requests the `admin:repo_hook` scope,
-run `gh auth refresh -h github.com -s admin:repo_hook`, then reload or
+alerts where appropriate. If the error reports a missing `security_events`
+scope, run `gh auth refresh -h github.com -s security_events`, then reload or
 synchronize the plugin after changing access.
 
 ### Inspect plugin logs

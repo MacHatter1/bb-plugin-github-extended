@@ -35,11 +35,19 @@ export function isSafeExternalUrl(value: unknown): value is string {
   }
 }
 
+export const AUTOMATION_PAGES = ["setup", "rules", "events", "audit", "polling"] as const;
+export type AutomationPage = (typeof AUTOMATION_PAGES)[number];
+
+export function isAutomationPage(value: string | undefined): value is AutomationPage {
+  return value !== undefined && (AUTOMATION_PAGES as readonly string[]).includes(value);
+}
+
 export type Route =
   | { view: "issues" }
   | { view: "pulls" }
   | { view: "dependabot" }
   | { view: "dependabot-alert"; repo: string; number: number }
+  | { view: "automation"; page: AutomationPage }
   | { view: "new" }
   | { view: "issue"; repo: string; number: number }
   | { view: "pull"; repo: string; number: number };
@@ -66,6 +74,9 @@ export function parseSubPath(subPath: string): Route {
     }
   }
   if (parts[0] === "dependabot") return { view: "dependabot" };
+  if (parts[0] === "automation") {
+    return { view: "automation", page: isAutomationPage(parts[1]) ? parts[1] : "setup" };
+  }
   if (parts[0] === "new") return { view: "new" };
   if (parts[0] === "issues" && parts.length === 4) {
     const number = parsePositiveIntegerSegment(parts[3]);
@@ -86,6 +97,8 @@ export function routeToSubPath(route: Route): string {
       return "dependabot";
     case "dependabot-alert":
       return "dependabot/" + route.repo + "/" + route.number;
+    case "automation":
+      return route.page === "setup" ? "automation" : `automation/${route.page}`;
     case "new":
       return "new";
     case "issue":
@@ -106,8 +119,72 @@ interface ParsedQuery {
   text: string[];
 }
 
+const REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$/;
+
+/** Normalize a GitHub repository name or URL to the owner/repository form used by RPC. */
+export function normalizeRepositoryReference(value: string): string | null {
+  const input = value.trim();
+  if (input.length === 0) return null;
+
+  let candidate = input;
+  const sshMatch = input.match(
+    /^(?:git@github\.com:|ssh:\/\/git@github\.com\/)(.+)$/i,
+  );
+  if (sshMatch !== null) {
+    candidate = sshMatch[1]!.replace(/\/+$/, "").replace(/\.git$/i, "");
+  } else if (/^(?:https?:\/\/|github\.com\/)/i.test(input)) {
+    let url: URL;
+    try {
+      url = new URL(/^github\.com\//i.test(input) ? `https://${input}` : input);
+    } catch {
+      return null;
+    }
+    if (
+      (url.protocol !== "https:" && url.protocol !== "http:") ||
+      url.hostname.toLowerCase() !== "github.com" ||
+      url.username.length > 0 ||
+      url.password.length > 0
+    ) {
+      return null;
+    }
+    candidate = url.pathname.replace(/\/+$/, "").replace(/\.git$/i, "").slice(1);
+  }
+
+  if (!REPOSITORY_NAME_PATTERN.test(candidate)) return null;
+  return candidate.toLowerCase();
+}
+
 function tokenizeQuery(query: string): string[] {
   return query.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+}
+
+export function queryHasToken(query: string, token: string): boolean {
+  const needle = token.toLowerCase();
+  return tokenizeQuery(query).some((entry) => entry.toLowerCase() === needle);
+}
+
+export function withoutPrefixedTokens(query: string, prefixes: readonly string[]): string {
+  const lowered = prefixes.map((prefix) => prefix.toLowerCase());
+  return tokenizeQuery(query)
+    .filter((entry) => !lowered.some((prefix) => entry.toLowerCase().startsWith(prefix)))
+    .join(" ")
+    .trim();
+}
+
+export function toggleQueryToken(
+  query: string,
+  token: string,
+  exclusivePrefixes: readonly string[] = [],
+): string {
+  if (queryHasToken(query, token)) {
+    return tokenizeQuery(query)
+      .filter((entry) => entry.toLowerCase() !== token.toLowerCase())
+      .join(" ")
+      .trim();
+  }
+  const base =
+    exclusivePrefixes.length > 0 ? withoutPrefixedTokens(query, exclusivePrefixes) : query.trim();
+  return `${base} ${token}`.trim();
 }
 
 function unquote(value: string): string {
@@ -116,9 +193,15 @@ function unquote(value: string): string {
 
 const STATE_VALUES: Record<string, string> = {
   open: "OPEN",
+  draft: "DRAFT",
   closed: "CLOSED",
   merged: "MERGED",
 };
+
+/** `is:open` includes draft pull requests, as it does on GitHub; `is:draft` narrows to them. */
+function stateMatches(wanted: string, actual: string): boolean {
+  return wanted === actual || (wanted === "OPEN" && actual === "DRAFT");
+}
 
 export type RepoHealthStatus = "never" | "syncing" | "healthy" | "partial" | "failed";
 
@@ -353,7 +436,10 @@ export function matchesQuery(
   query: ParsedQuery,
   viewer: string | null,
 ): boolean {
-  if (query.states.length > 0 && !query.states.includes(item.state)) {
+  if (
+    query.states.length > 0 &&
+    !query.states.some((state) => stateMatches(state, item.state))
+  ) {
     return false;
   }
   if (query.assignees.length > 0) {
@@ -402,7 +488,7 @@ export interface Suggestion {
 }
 
 const QUALIFIER_KEYS: Array<{ key: string; hint: string }> = [
-  { key: "is:", hint: "state — open, closed, merged" },
+  { key: "is:", hint: "state — open, closed, merged, draft" },
   { key: "assignee:", hint: "assigned user, or @me" },
   { key: "author:", hint: "opened by" },
   { key: "label:", hint: "has label" },
@@ -471,7 +557,7 @@ export function buildSuggestions(
   }
   if (key === "is" || key === "state") {
     const states =
-      kind === "pr" ? ["open", "closed", "merged"] : ["open", "closed"];
+      kind === "pr" ? ["open", "draft", "closed", "merged"] : ["open", "closed"];
     return states.filter(matches).map((state) => ({
       insert: `${key}:${state} `,
       label: state,
