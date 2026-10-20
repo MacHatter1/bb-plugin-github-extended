@@ -6,6 +6,8 @@ All notable changes to GitHub Extended are documented here. The format follows
 
 ## Unreleased
 
+## 0.1.3 - 2026-10-20
+
 ### Added
 
 - Approval-gated automation for issues, pull requests, reviews, CI, and

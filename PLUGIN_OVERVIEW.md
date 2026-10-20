@@ -1,5 +1,3 @@
-# GitHub Extended
-
 Keep GitHub work moving, from one BB inbox.
 
 GitHub Extended adds GitHub+ to BB. Browse issues, pull requests, and Dependabot

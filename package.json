@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-github-extended",
-  "version": "0.2.0",
+  "version": "0.1.3",
   "description": "Browse GitHub issues, pull requests, and Dependabot alerts, and automate GitHub workflows in BB.",
   "type": "module",
   "license": "MIT",
