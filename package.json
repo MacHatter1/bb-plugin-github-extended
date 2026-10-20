@@ -42,6 +42,9 @@
     "skills",
     "styles.css",
     "README.md",
+    "docs",
+    "PLUGIN_OVERVIEW.md",
+    "CHANGELOG.md",
     "tsconfig.json",
     "vitest.config.ts"
   ],

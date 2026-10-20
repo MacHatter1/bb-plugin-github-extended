@@ -1,43 +1,48 @@
-# Dependencies and package-manager state
+# Build output and dependencies
+dist/
 node_modules/
-.npm/
-.pnpm-store/
-.yarn/
-.npmrc
-!.npmrc.example
+coverage/
+*.tsbuildinfo
+
+# bb and agent workspace state (chat copies, notes, local settings)
+.bb/
+.claude/
+.codex/
+.cursor/
+CLAUDE.local.md
 
 # Local environment and secrets
 .env
 .env.*
 !.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Additional package and runtime files
+.npm/
+.pnpm-store/
+.yarn/
+.npmrc
+!.npmrc.example
 *.pem
 *.key
-
-# Generated artifacts and local runtime data
-dist/
-coverage/
 .vite/
-*.tsbuildinfo
 *.tgz
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite3
-
-# Logs
-*.log
-npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-
-# Temporary package verification directories
 .package-consumer-*/
-
-# Local BB workflow files
-.bb/workflows/
-
-# Local OS files
-.DS_Store
-Thumbs.db
