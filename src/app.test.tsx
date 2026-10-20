@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
-import { fireEvent } from "@testing-library/react";
+import { cleanup, fireEvent } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+
+afterEach(() => { cleanup(); window.localStorage.clear(); });
 
 const app = await loadPluginApp(() => import("./app"));
 
@@ -13,7 +15,7 @@ describe("GitHub app navigation", () => {
     expect(app.threadPanelActions[0]?.title).toBe("GitHub+ PR");
   });
 
-  it("keeps the Dependabot tab routed to Dependabot", async () => {
+  it("keeps legacy security routes inside Inbox", async () => {
     const slot = renderSlot(
       app.navPanels[0]!,
       { subPath: "dependabot" },
@@ -37,7 +39,7 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    const dependabotTab = slot.getByRole("tab", { name: "Dependabot" });
+    const dependabotTab = slot.getByRole("tab", { name: "Inbox" });
     const panelId = dependabotTab.getAttribute("aria-controls");
     expect(panelId).toBeTruthy();
     expect(slot.container.querySelector("#" + panelId)?.getAttribute("role")).toBe("tabpanel");
@@ -46,16 +48,16 @@ describe("GitHub app navigation", () => {
     expect(slot.navigateCalls).toContainEqual({
       method: "toPluginPanel",
       path: "github",
-      options: { subPath: "dependabot" },
+      options: { subPath: "" },
     });
     slot.lifecycle.unmount();
   });
 
-  it("explains unavailable Dependabot alerts with a remediation", async () => {
+  it("keeps disabled Dependabot alerts separate from missing permissions", async () => {
     const message = [
       "gh api --paginate --jq failed: gh: Dependabot alerts are disabled for this repository. (HTTP 403)",
-      'gh: This API operation needs the "admin:repo_hook" scope. To request it, run:',
-      "gh auth refresh -h github.com -s admin:repo_hook",
+      'gh: This API operation needs the "delete_repo" scope. To request it, run:',
+      "gh auth refresh -h github.com -s delete_repo",
     ].join("\n");
     const slot = renderSlot(
       app.navPanels[0]!,
@@ -92,24 +94,18 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    const notices = slot.container.querySelectorAll(".github-alert-error");
-    expect(notices).toHaveLength(2);
-    const rowNotice = notices[0]!;
-    expect(rowNotice.textContent).toContain("Dependabot alerts are unavailable");
-    expect(rowNotice.textContent).toContain("Enable them in GitHub");
-    const notice = notices[1]!;
-    expect(notice.textContent).toContain("Dependabot alerts are unavailable");
-    expect(notice.textContent).toContain("Enable them in GitHub");
-    expect(notice.textContent).toContain("Refresh it with");
-    const command = [...notice.querySelectorAll("code")].find((element) =>
-      element.textContent?.startsWith("gh auth refresh"),
+    await slot.getByRole("button", { name: "Settings" }).click();
+    const notices = Array.from(
+      slot.container.querySelectorAll(".github-alert-error") as NodeListOf<HTMLElement>,
     );
-    expect(command?.textContent).toBe(
-      "gh auth refresh -h github.com -s admin:repo_hook",
-    );
-    expect(notice.querySelector("details")?.textContent).toContain(
-      "Dependabot alerts are disabled for this repository.",
-    );
+    expect(notices.length).toBeGreaterThan(0);
+    for (const notice of notices) {
+      expect(notice.textContent).toMatch(/Enable (?:alerts|them) in GitHub/);
+
+      expect(notice.textContent).not.toContain("delete_repo");
+      expect(notice.querySelector("code")).toBeNull();
+      expect(notice.querySelector("details")).toBeNull();
+    }
     slot.lifecycle.unmount();
   });
 
@@ -217,12 +213,90 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    expect(slot.queryByPlaceholderText("Add owner/repository")).toBeNull();
-    const reposToggle = slot.getByRole("button", { name: "1 repo" });
+    expect(slot.queryByPlaceholderText("Add owner/repository or GitHub URL")).toBeNull();
+    const reposToggle = slot.container.querySelector(
+      'button[aria-controls="github-repos-drawer"]',
+    ) as HTMLButtonElement;
     expect(reposToggle.getAttribute("aria-expanded")).toBe("false");
     await reposToggle.click();
     expect(reposToggle.getAttribute("aria-expanded")).toBe("true");
-    expect(slot.getByPlaceholderText("Add owner/repository")).toBeTruthy();
+    expect(slot.getByPlaceholderText("Add owner/repository or GitHub URL")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("loads repository count badges through one batched summary RPC", async () => {
+    const listItems = vi.fn(() => ({ items: [] }));
+    const listDependabotAlerts = vi.fn(() => ({
+      alerts: [],
+      errors: [],
+      stats: { totalCount: 0, highCriticalCount: 0, withFixCount: 0, withoutFixCount: 0 },
+    }));
+    const listRepositorySummaries = vi.fn(() => ({
+      repos: [{
+        repo: "acme/widgets",
+        issueCount: 4,
+        pullRequestCount: 2,
+        alertCount: 3,
+      }],
+    }));
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          listItems,
+          listLinks: () => ({ links: {} }),
+          listDependabotAlerts,
+          listRepositorySummaries,
+          status: () => ({
+            ghOk: true,
+            ghState: "ready",
+            ghError: null,
+            repos: [{
+              repo: "acme/widgets",
+              projectId: null,
+              health: {
+                status: "ok",
+                lastAttemptAt: null,
+                lastSuccessAt: null,
+                itemCount: 1,
+                alertCount: 0,
+                error: null,
+              },
+            }],
+            lastSyncedAt: "2026-08-20T00:00:00.000Z",
+          }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(listRepositorySummaries).not.toHaveBeenCalled();
+    const itemCallsBeforeOpening = listItems.mock.calls.length;
+    const reposToggle = slot.container.querySelector(
+      'button[aria-controls="github-repos-drawer"]',
+    ) as HTMLButtonElement;
+    await reposToggle.click();
+
+    await vi.waitFor(() => {
+      expect(listRepositorySummaries).toHaveBeenCalledTimes(1);
+      const drawer = slot.container.querySelector("#github-repos-drawer");
+      expect(drawer).toBeTruthy();
+      const badges = Array.from(
+        drawer!.querySelectorAll("span") as NodeListOf<HTMLSpanElement>,
+      )
+        .filter((element: HTMLSpanElement) =>
+          ["Issues", "PRs", "Alerts"].includes(element.textContent ?? ""),
+        )
+        .map((label: HTMLSpanElement) => [
+          label.textContent,
+          label.previousElementSibling?.textContent,
+        ]);
+      expect(badges).toEqual([["Issues", "4"], ["PRs", "2"], ["Alerts", "3"]]);
+    });
+    expect(listItems).toHaveBeenCalledTimes(itemCallsBeforeOpening);
+    expect(listDependabotAlerts).not.toHaveBeenCalled();
     slot.lifecycle.unmount();
   });
 
@@ -300,11 +374,12 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    expect(slot.queryByRole("option", { name: "acme/widgets" })).toBeNull();
-    await slot.getByRole("button", { name: "Repository" }).click();
-    expect(slot.getByRole("option", { name: "acme/widgets" })).toBeTruthy();
-    await slot.getByRole("option", { name: "acme/widgets" }).click();
-    expect(slot.queryByRole("option", { name: "acme/widgets" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "acme/widgets", exact: true })).toBeNull();
+    await (slot.container.querySelector("#github-new-issue-repo") as HTMLButtonElement).click();
+    const option = slot.getByRole("listbox").querySelector('[role="option"]:last-child') as HTMLButtonElement;
+    expect(option.textContent).toBe("acme/widgets");
+    await option.click();
+    expect(slot.queryByRole("button", { name: "acme/widgets", exact: true })).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -329,7 +404,7 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    const trigger = slot.getByRole("button", { name: "Repository" });
+    const trigger = (slot.container.querySelector("#github-new-issue-repo") as HTMLButtonElement);
     trigger.focus();
     await act(async () => {
       trigger.dispatchEvent(
@@ -618,10 +693,14 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    expect(slot.getByRole("alert").textContent).toContain("status offline");
+    const statusAlert = (): HTMLElement | undefined =>
+      slot.queryAllByRole("alert").find((alert: HTMLElement) =>
+        alert.textContent?.includes("status offline"),
+      );
+    expect(statusAlert()?.textContent).toContain("status offline");
     await slot.getByRole("button", { name: "Retry GitHub status" }).click();
     await act(async () => {});
-    expect(slot.queryByRole("alert")).toBeNull();
+    expect(statusAlert()).toBeUndefined();
     expect(attempts).toBe(2);
     slot.lifecycle.unmount();
   });
@@ -1115,6 +1194,165 @@ describe("GitHub loading states", () => {
     await act(async () => {
       resolvePull?.({ pull: null });
     });
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("GitHub list UX", () => {
+  const readyStatus = {
+    ghOk: true,
+    ghState: "ready",
+    ghError: null,
+    repos: [{
+      repo: "acme/widgets",
+      projectId: null,
+      health: { status: "healthy", lastAttemptAt: null, lastSuccessAt: null, itemCount: 1, alertCount: 0, error: null },
+    }],
+    lastSyncedAt: "2026-08-20T00:00:00.000Z",
+  };
+
+  function issueItem(title: string, number: number, extra: Record<string, unknown> = {}) {
+    return {
+      repo: "acme/widgets",
+      number,
+      kind: "issue" as const,
+      title,
+      state: "OPEN",
+      author: "octocat",
+      labels: [],
+      assignees: [],
+      url: `https://github.com/acme/widgets/issues/${number}`,
+      body: "",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      ...extra,
+    };
+  }
+
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("toggles quick filters into the query and focuses the filter from slash", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listItems: () => ({ items: [issueItem("Cache bug", 7)] }),
+          listLinks: () => ({ links: {} }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    const filters = Array.from(
+      slot.container.querySelectorAll('[role="group"][aria-label="Quick filters"]') as NodeListOf<HTMLElement>,
+    ).find((group) => {
+      const buttons = Array.from(group.querySelectorAll("button")) as HTMLButtonElement[];
+      return buttons.map((button) => button.textContent?.trim()).join(",") === "Open,Closed,Assigned to me";
+    });
+    expect(filters).toBeTruthy();
+    expect(filters?.querySelector('[aria-pressed="true"]')?.textContent).toBe("Open");
+    const issuePanel = filters?.closest('[role="tabpanel"]');
+    const assignedFilter = Array.from(filters!.querySelectorAll("button") as NodeListOf<HTMLButtonElement>).find(
+      (button) => button.textContent?.trim() === "Assigned to me",
+    )!;
+    await assignedFilter.click();
+    const input = issuePanel?.querySelector(
+      '[role="combobox"][aria-label="Filter issues"]',
+    ) as HTMLInputElement;
+    expect(input.value).toBe("is:open assignee:@me");
+
+    input.blur();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "/", bubbles: true, cancelable: true }));
+    });
+    expect(document.activeElement).toBe(input);
+    slot.lifecycle.unmount();
+  });
+
+  it("opens an issue from the row, not only the title control", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listItems: () => ({ items: [issueItem("Row click target", 42)] }),
+          listLinks: () => ({ links: {} }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    await slot.getByText("#42").click();
+    expect(slot.navigateCalls).toContainEqual({
+      method: "toPluginPanel",
+      path: "github",
+      options: { subPath: "issues/acme/widgets/42" },
+    });
+    slot.lifecycle.unmount();
+  });
+
+  it("paginates long issue lists", async () => {
+    const items = Array.from({ length: 26 }, (_, index) => issueItem(`Issue ${index + 1}`, index + 1));
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "issues" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          listItems: () => ({ items }),
+          listLinks: () => ({ links: {} }),
+          viewer: () => ({ login: "octocat" }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    expect(slot.getByText("Showing 1–25 of 26")).toBeTruthy();
+    expect(slot.queryByText("Issue 26")).toBeNull();
+    await slot.getByRole("button", { name: "Next" }).click();
+    expect(slot.getByText("Issue 26")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("turns Dependabot summary cards into severity and fix filters", async () => {
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "dependabot" },
+      {
+        rpc: {
+          status: () => readyStatus,
+          viewer: () => ({ login: "octocat" }),
+          listDependabotAlerts: () => ({
+            alerts: [{
+              repo: "acme/widgets",
+              number: 3,
+              state: "open",
+              severity: "high",
+              packageName: "left-pad",
+              ecosystem: "npm",
+              summary: "bad pad",
+              vulnerableVersionRange: "<1.0.0",
+              firstPatchedVersion: "1.0.1",
+              updatedAt: "2026-08-20T00:00:00.000Z",
+            }],
+            errors: [],
+            stats: { totalCount: 1, highCriticalCount: 1, withFixCount: 1, withoutFixCount: 0 },
+          }),
+        },
+      },
+    ) as any;
+
+    await act(async () => {});
+    await slot.getByRole("button", { name: "High / critical" }).click();
+    expect((slot.getByRole("combobox", { name: "Filter alerts" }) as HTMLInputElement).value).toBe(
+      "is:open severity:high severity:critical",
+    );
     slot.lifecycle.unmount();
   });
 });

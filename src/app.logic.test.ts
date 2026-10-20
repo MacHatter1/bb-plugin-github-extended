@@ -6,10 +6,13 @@ import {
   normalizeStatus,
   parseQuery,
   parseSubPath,
+  queryHasToken,
   repoHealthColorCounts,
   repoHealthDotClass,
   routeToSubPath,
   summarizeRepoHealth,
+  toggleQueryToken,
+  withoutPrefixedTokens,
   worstRepoHealth,
   type Item,
   type Route,
@@ -146,6 +149,10 @@ describe("external URL policy", () => {
 describe("github panel routes", () => {
   it("round-trips list, create, issue, and pull routes", () => {
     const routes: Route[] = [
+      { view: "inbox" },
+      { view: "activity" },
+      { view: "agent", kind: "pr", repo: "acme/widgets", number: 4 },
+      { view: "agent", kind: "security", repo: "acme/widgets", number: 2 },
       { view: "issues" },
       { view: "pulls" },
       { view: "dependabot" },
@@ -182,7 +189,7 @@ describe("github panel routes", () => {
       expect(parseSubPath(value).view).toMatch(/issues|pulls|dependabot/);
       expect(parseSubPath(value).view).not.toMatch(/^(issue|pull|dependabot-alert)$/);
     }
-    expect(parseSubPath("")).toEqual({ view: "issues" });
+    expect(parseSubPath("")).toEqual({ view: "inbox" });
   });
 });
 
@@ -219,6 +226,22 @@ describe("github panel query engine", () => {
     expect(matchesQuery(issue, parseQuery("state:"), "octocat")).toBe(true);
   });
 
+  it("toggles exclusive filter tokens without disturbing unrelated text", () => {
+    expect(queryHasToken("is:open label:bug", "is:open")).toBe(true);
+    expect(queryHasToken("is:open label:bug", "is:closed")).toBe(false);
+    expect(toggleQueryToken("", "is:open", ["is:", "state:"])).toBe("is:open");
+    expect(toggleQueryToken("is:open", "is:open", ["is:", "state:"])).toBe("");
+    expect(toggleQueryToken("is:open cache", "is:closed", ["is:", "state:"])).toBe(
+      "cache is:closed",
+    );
+    expect(toggleQueryToken('label:"good first issue"', "assignee:@me")).toBe(
+      'label:"good first issue" assignee:@me',
+    );
+    expect(withoutPrefixedTokens("severity:low repo:acme/widgets", ["severity:"])).toBe(
+      "repo:acme/widgets",
+    );
+  });
+
   it("builds bounded qualifier values without losing labels containing spaces", () => {
     const vocab = {
       users: ["alice", "octocat"],
@@ -232,6 +255,7 @@ describe("github panel query engine", () => {
 
     expect(compact("is:", "pr")).toEqual([
       { insert: "is:open ", label: "open" },
+      { insert: "is:draft ", label: "draft" },
       { insert: "is:closed ", label: "closed" },
       { insert: "is:merged ", label: "merged" },
     ]);

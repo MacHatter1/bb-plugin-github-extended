@@ -54,8 +54,9 @@ export const Button = forwardRef<
     <button
       ref={ref}
       {...props}
+      data-variant={variant}
       className={cn(
-        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+        "gh-control inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
         variant === "default" && "bg-foreground text-background hover:bg-accent hover:text-foreground",
         variant === "outline" && "border border-input bg-transparent hover:bg-accent",
         variant === "ghost" && "bg-transparent hover:bg-accent",
@@ -69,9 +70,10 @@ export const Button = forwardRef<
   );
 });
 
-export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...props }, ref) {
   return (
     <input
+      ref={ref}
       {...props}
       className={cn(
         "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
@@ -79,7 +81,7 @@ export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElem
       )}
     />
   );
-}
+});
 
 export const Textarea = forwardRef<
   HTMLTextAreaElement,
@@ -457,8 +459,8 @@ export function Tabs({ value, onValueChange, children }: { value: string; onValu
   const id = useId();
   return <TabsContext.Provider value={{ value, setValue: onValueChange, id }}><div>{children}</div></TabsContext.Provider>;
 }
-export function TabsList({ children }: { children: ReactNode }) {
-  return <div role="tablist" aria-label="GitHub views" className="inline-flex items-center gap-1 rounded-md bg-muted p-1">{children}</div>;
+export function TabsList({ children, className }: { children: ReactNode; className?: string }) {
+  return <div role="tablist" aria-label="GitHub views" className={cn("inline-flex max-w-full items-center gap-1 overflow-x-auto rounded-md bg-muted p-1", className)}>{children}</div>;
 }
 export function TabsTrigger({ value, children }: { value: string; children: ReactNode }) {
   const tabs = useContext(TabsContext);
@@ -472,5 +474,5 @@ export function TabsPanel({ value, children }: { value: string; children: ReactN
   const active = tabs?.value === value;
   const panelId = tabs === null ? undefined : `${tabs.id}-panel-${value}`;
   const tabId = tabs === null ? undefined : `${tabs.id}-tab-${value}`;
-  return <div id={panelId} role="tabpanel" aria-labelledby={tabId} hidden={!active} tabIndex={0}>{children}</div>;
+  return <div id={panelId} role="tabpanel" aria-labelledby={tabId} hidden={!active} tabIndex={0}>{active ? children : null}</div>;
 }
