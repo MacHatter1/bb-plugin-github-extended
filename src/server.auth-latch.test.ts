@@ -93,6 +93,7 @@ async function loadWithSyncServiceOnce(
   const { bb, harness } = createFakePluginHost({
     pluginId: "github",
     settings: options.settings,
+    sdk: { projects: { list: async () => [] } },
   });
   await plugin(bb);
   const callsBeforeService = ghCalls().length;
@@ -102,7 +103,7 @@ async function loadWithSyncServiceOnce(
       const syncSettled = harness.logEntries.some((entry) =>
         /synced \d+ item|sync failed/.test(entry.message),
       );
-      expect(ghCalls().length > callsBeforeService || syncSettled).toBe(true);
+      expect(syncSettled || (!existsSync(apiDownFlag) && ghCalls().length > callsBeforeService)).toBe(true);
     },
     { timeout: 4_000 },
   );

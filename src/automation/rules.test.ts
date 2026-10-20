@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AutomationRule, NormalisedEvent } from "./domain";
+import { renderTemplate } from "./domain";
 import { matchingRules, rulesUsePaths, wildcard } from "./rules";
 
 const event: NormalisedEvent = {
@@ -38,6 +39,10 @@ const rule = (
 });
 
 describe("ordered rule matching", () => {
+  it("inserts agent output literally without expanding placeholders or replacement patterns inside it", () => {
+    expect(renderTemplate("{{repo}}: {{agent}} / {{review}} / {{unknown}}", event, "Cost: $&", "Keep {{repo}} and $& literal"))
+      .toBe("acme/web: Keep {{repo}} and $& literal / Cost: $& / {{unknown}}");
+  });
   it("matches branch, actor, label, draft and path filters in order", () => {
     const result = matchingRules(
       [

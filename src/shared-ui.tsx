@@ -54,8 +54,9 @@ export const Button = forwardRef<
     <button
       ref={ref}
       {...props}
+      data-variant={variant}
       className={cn(
-        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+        "gh-control inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
         variant === "default" && "bg-foreground text-background hover:bg-accent hover:text-foreground",
         variant === "outline" && "border border-input bg-transparent hover:bg-accent",
         variant === "ghost" && "bg-transparent hover:bg-accent",
@@ -69,9 +70,10 @@ export const Button = forwardRef<
   );
 });
 
-export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...props }, ref) {
   return (
     <input
+      ref={ref}
       {...props}
       className={cn(
         "flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
@@ -79,7 +81,7 @@ export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElem
       )}
     />
   );
-}
+});
 
 export const Textarea = forwardRef<
   HTMLTextAreaElement,

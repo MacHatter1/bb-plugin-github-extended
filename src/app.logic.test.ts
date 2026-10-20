@@ -149,6 +149,10 @@ describe("external URL policy", () => {
 describe("github panel routes", () => {
   it("round-trips list, create, issue, and pull routes", () => {
     const routes: Route[] = [
+      { view: "inbox" },
+      { view: "activity" },
+      { view: "agent", kind: "pr", repo: "acme/widgets", number: 4 },
+      { view: "agent", kind: "security", repo: "acme/widgets", number: 2 },
       { view: "issues" },
       { view: "pulls" },
       { view: "dependabot" },
@@ -185,7 +189,7 @@ describe("github panel routes", () => {
       expect(parseSubPath(value).view).toMatch(/issues|pulls|dependabot/);
       expect(parseSubPath(value).view).not.toMatch(/^(issue|pull|dependabot-alert)$/);
     }
-    expect(parseSubPath("")).toEqual({ view: "issues" });
+    expect(parseSubPath("")).toEqual({ view: "inbox" });
   });
 });
 

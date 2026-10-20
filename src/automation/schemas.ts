@@ -7,6 +7,8 @@ import {
   CONDITION_OPERATORS,
   EVENT_KINDS,
   JOB_STATUSES,
+  isIssueEvent,
+  supportsIssueEvents,
 } from "./domain.js";
 import {
   POLL_INTERVAL_MAX_SECONDS,
@@ -69,13 +71,23 @@ const filtersSchema = z
 const actionParametersSchema = z
   .object({
     reviewPrompt: z.string().max(20_000).optional(),
+    agentPrompt: z.string().trim().min(1).max(20_000).optional(),
     bodyTemplate: z.string().max(20_000).optional(),
     targetBranch: branchNameSchema.optional(),
     label: z.string().min(1).max(100).optional(),
   })
   .strict();
 
-export const ruleSchema = z
+function validateRuleActions(rule: Pick<z.output<typeof ruleObjectSchema>, "actions" | "events" | "actionParameters">, context: z.RefinementCtx) {
+  if (rule.actions.includes("bb.agent") && !rule.actionParameters.agentPrompt) {
+    context.addIssue({ code: "custom", path: ["actionParameters", "agentPrompt"], message: "Describe what the agent should do" });
+  }
+  if (rule.events.some(isIssueEvent) && rule.actions.some((action) => !supportsIssueEvents(action))) {
+    context.addIssue({ code: "custom", path: ["actions"], message: "Issue triggers support Run agent, comments, labels, and checkout updates. Put PR review actions in a separate rule." });
+  }
+}
+
+const ruleObjectSchema = z
   .object({
     id: z.string().min(1).max(100),
     name: z.string().min(1).max(160),
@@ -91,14 +103,17 @@ export const ruleSchema = z
   })
   .strict();
 
-export const createRuleInputSchema = ruleSchema
+export const ruleSchema = ruleObjectSchema.superRefine(validateRuleActions);
+
+export const createRuleInputSchema = ruleObjectSchema
   .omit({ id: true, order: true, repos: true })
   .extend({
     enabled: z.boolean().default(false),
     approvalRequired: z.boolean().default(true),
     repo: automationRepoNameSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(validateRuleActions);
 
 export const automationRepositorySchema = z
   .object({
@@ -129,6 +144,7 @@ export const jobSchema = z
     repo: z.string(),
     kind: z.enum(EVENT_KINDS),
     prNumber: z.number().int().nullable(),
+    issueNumber: z.number().int().nullable(),
     title: z.string(),
     status: z.enum(JOB_STATUSES),
     attempts: z.number().int(),
@@ -151,6 +167,14 @@ export const auditSchema = z
     detail: z.string(),
   })
   .strict();
+
+const jobPageSchema = z.object({
+  jobs: z.array(jobSchema),
+  total: z.number().int().nonnegative(),
+  audit: z.array(auditSchema),
+}).strict();
+
+export type JobPage = z.output<typeof jobPageSchema>;
 
 const pollRepositoryStatusSchema = z
   .object({
@@ -224,6 +248,14 @@ export const dashboardSchema = z
 /** Spread into the plugin's single `defineRpcContract` call. */
 export const automationRpcMethods = {
   automationDashboard: { input: z.null(), output: dashboardSchema },
+  automationListJobs: {
+    input: z.object({
+      repo: automationRepoNameSchema.optional(),
+      offset: z.number().int().nonnegative().default(0),
+      limit: z.number().int().min(1).max(100).default(25),
+    }).strict(),
+    output: jobPageSchema,
+  },
   automationSetRepository: {
     input: z
       .object({
@@ -235,8 +267,12 @@ export const automationRpcMethods = {
     output: automationRepositorySchema,
   },
   automationSaveRules: {
-    input: z.object({ rules: z.array(ruleSchema).max(100) }).strict(),
+    input: z.object({ rules: z.array(ruleSchema).max(100), expectedRules: z.array(ruleSchema).max(100).optional() }).strict(),
     output: z.object({ saved: z.number().int() }).strict(),
+  },
+  automationSetRuleEnabled: {
+    input: z.object({ id: z.string().min(1).max(100), enabled: z.boolean() }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
   automationPollNow: { input: z.null(), output: pollRunSchema },
   automationSetPolling: {

@@ -35,7 +35,7 @@ export function isSafeExternalUrl(value: unknown): value is string {
   }
 }
 
-export const AUTOMATION_PAGES = ["setup", "rules", "events", "audit", "polling"] as const;
+export const AUTOMATION_PAGES = ["setup", "rules", "create", "events", "audit", "polling"] as const;
 export type AutomationPage = (typeof AUTOMATION_PAGES)[number];
 
 export function isAutomationPage(value: string | undefined): value is AutomationPage {
@@ -43,6 +43,9 @@ export function isAutomationPage(value: string | undefined): value is Automation
 }
 
 export type Route =
+  | { view: "inbox" }
+  | { view: "activity" }
+  | { view: "agent"; kind: "issue" | "pr" | "security"; repo: string; number: number }
   | { view: "issues" }
   | { view: "pulls" }
   | { view: "dependabot" }
@@ -60,6 +63,10 @@ function parsePositiveIntegerSegment(value: string): number | null {
 
 export function parseSubPath(subPath: string): Route {
   const parts = subPath.split("/").filter((part) => part.length > 0);
+  if (parts[0] === "agent" && parts.length === 5 && (parts[1] === "issue" || parts[1] === "pr" || parts[1] === "security")) {
+    const number = parsePositiveIntegerSegment(parts[4]);
+    if (number !== null) return { view: "agent", kind: parts[1], repo: `${parts[2]}/${parts[3]}`, number };
+  }
   if (parts[0] === "pulls" && parts.length === 4) {
     const number = parsePositiveIntegerSegment(parts[3]);
     if (number !== null) {
@@ -75,8 +82,9 @@ export function parseSubPath(subPath: string): Route {
   }
   if (parts[0] === "dependabot") return { view: "dependabot" };
   if (parts[0] === "automation") {
-    return { view: "automation", page: isAutomationPage(parts[1]) ? parts[1] : "setup" };
+    return { view: "automation", page: isAutomationPage(parts[1]) ? parts[1] : "rules" };
   }
+  if (parts[0] === "activity") return { view: "activity" };
   if (parts[0] === "new") return { view: "new" };
   if (parts[0] === "issues" && parts.length === 4) {
     const number = parsePositiveIntegerSegment(parts[3]);
@@ -84,11 +92,17 @@ export function parseSubPath(subPath: string): Route {
       return { view: "issue", repo: `${parts[1]}/${parts[2]}`, number };
     }
   }
-  return { view: "issues" };
+  return parts[0] === "issues" ? { view: "issues" } : { view: "inbox" };
 }
 
 export function routeToSubPath(route: Route): string {
   switch (route.view) {
+    case "inbox":
+      return "";
+    case "activity":
+      return "activity";
+    case "agent":
+      return `agent/${route.kind}/${route.repo}/${route.number}`;
     case "issues":
       return "issues";
     case "pulls":
@@ -98,7 +112,7 @@ export function routeToSubPath(route: Route): string {
     case "dependabot-alert":
       return "dependabot/" + route.repo + "/" + route.number;
     case "automation":
-      return route.page === "setup" ? "automation" : `automation/${route.page}`;
+      return route.page === "rules" ? "automation" : `automation/${route.page}`;
     case "new":
       return "new";
     case "issue":

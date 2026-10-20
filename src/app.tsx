@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
+  experimental_Icon as Icon,
   experimental_Diff as Diff,
   useBbNavigate,
   useRealtime,
@@ -17,10 +18,8 @@ import {
   parseQuery,
   parseSubPath,
   queryHasToken,
-  repoHealthColorCounts,
   repoHealthDotClass,
   routeToSubPath,
-  summarizeRepoHealth,
   toggleQueryToken,
   withoutPrefixedTokens,
   type GithubStatus,
@@ -54,6 +53,7 @@ import {
 } from "./saved-views.js";
 import "../styles.css";
 import "./ui-fixes.css";
+import "./workbench.css";
 import { toast } from "sonner";
 import { Badge } from "./shared-ui.js";
 import { Button } from "./shared-ui.js";
@@ -84,6 +84,9 @@ import { Textarea } from "./shared-ui.js";
 import { EmptyState } from "@/components/empty-state";
 import { Markdown, SafeUrlLink } from "@/components/markdown-lite";
 import { AutomationDirective, AutomationView } from "./automation-view.js";
+import { InboxView } from "./inbox-view.js";
+import { AgentTaskView, AskAgent } from "./agent-task.js";
+import { PageHeading, WorkItemHeading } from "./surface-ui.js";
 
 interface IssueComment {
   author: string;
@@ -151,7 +154,7 @@ interface PullDetail {
 }
 
 interface ThreadLink {
-  kind: "issue" | "pr";
+  kind: "issue" | "pr" | "security";
   repo: string;
   number: number;
   threadId: string;
@@ -344,36 +347,6 @@ function LinkErrorNotice({
       </button>
     </div>
   );
-}
-
-function useSpawn(): {
-  spawn: (
-    method: "startWork" | "startReview",
-    repo: string,
-    number: number,
-  ) => void;
-  spawningKey: string | null;
-} {
-  const rpc = useRpc<typeof githubRpcContract>();
-  const navigate = useBbNavigate();
-  const [spawningKey, setSpawningKey] = useState<string | null>(null);
-  const spawn = useCallback(
-    (method: "startWork" | "startReview", repo: string, number: number) => {
-      setSpawningKey(`${repo}#${number}`);
-      rpc
-        .call(method, { repo, number })
-        .then((result) => {
-          const threadId = (result as { threadId?: unknown })?.threadId;
-          if (typeof threadId !== "string")
-            throw new Error("malformed spawn result");
-          navigate.toThread(threadId);
-        })
-        .catch((error: unknown) => toast.error(errorText(error)))
-        .finally(() => setSpawningKey(null));
-    },
-    [rpc, navigate],
-  );
-  return { spawn, spawningKey };
 }
 
 let viewerLogin: string | null = null;
@@ -1016,8 +989,6 @@ function ItemRow({
   links: ThreadLink[] | undefined;
   onOpen: () => void;
 }) {
-  const { spawn, spawningKey } = useSpawn();
-  const busy = spawningKey === `${item.repo}#${item.number}`;
   return (
     <div
       className="grid cursor-pointer grid-cols-1 gap-y-2 px-3 py-3 transition-colors hover:bg-accent/50 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3 @[48rem]:py-2.5"
@@ -1083,24 +1054,7 @@ function ItemRow({
           {relativeTime(item.updatedAt)}
         </span>
         <span className={`${COL.actions} @[48rem]:order-6`}>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 gap-1.5"
-            disabled={spawningKey !== null}
-            aria-busy={busy}
-            onClick={(event) => {
-              event.stopPropagation();
-              spawn(
-                item.kind === "issue" ? "startWork" : "startReview",
-                item.repo,
-                item.number,
-              );
-            }}
-          >
-            {busy ? <Spinner className="size-3" /> : null}
-            {item.kind === "issue" ? "Start" : "Review"}
-          </Button>
+          <AskAgent kind={item.kind} repo={item.repo} number={item.number} />
           <RowMenu item={item} />
         </span>
       </span>
@@ -1417,7 +1371,7 @@ function PageControls({
 
 function SidebarHeading({ children }: { children: React.ReactNode }) {
   return (
-    <h3 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+    <h3 className="gh-sidebar-heading">
       {children}
     </h3>
   );
@@ -1601,7 +1555,6 @@ function IssueDetailView({
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const { links, error: linksError, refetch: retryLinks } = useLinks();
-  const { spawn, spawningKey } = useSpawn();
   const { setIssueState, setAssignees, setLabels } = useIssueMutations();
   const [detail, setDetail] = useState<IssueDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1804,7 +1757,7 @@ function IssueDetailView({
 
   const issueLinks = links[`issue:${repo}#${number}`];
   return (
-    <div className="flex flex-col gap-4" aria-busy={loading || posting || statePending}>
+    <div className="gh-detail gh-stack" aria-busy={loading || posting || statePending}>
       {loading ? <RefreshBar visible /> : null}
       {error !== null ? (
         <div
@@ -1818,85 +1771,66 @@ function IssueDetailView({
         </div>
       ) : null}
       <LinkErrorNotice error={linksError} onRetry={retryLinks} />
-      <div className="flex items-center gap-1 text-xs text-muted-foreground">
-        <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
-          ← Issues
-        </Button>
-        <span>
-          {repo} · #{number}
-        </span>
-        <span className="flex-1" />
-        <SafeUrlLink href={detail.url} className="underline hover:text-foreground">
-          Open on GitHub ↗
-        </SafeUrlLink>
-      </div>
-
-      <div className="flex items-start gap-3">
-        <h2 className="min-w-0 flex-1 text-xl font-semibold text-foreground">
-          {detail.title}{" "}
-          <span className="font-normal text-muted-foreground">
-            #{detail.number}
-          </span>
-        </h2>
+      <WorkItemHeading
+        title={detail.title}
+        number={detail.number}
+        repo={repo}
+        onBack={onBack}
+        source={<SafeUrlLink href={detail.url}>Open on GitHub <Icon name="ExternalLink" aria-hidden="true" /></SafeUrlLink>}
+        action={<AskAgent kind="issue" repo={repo} number={number} />}
+      >
         <StateBadge kind="issue" state={detail.state} />
-        <Button
-          size="sm"
-          className="gap-1.5"
-          disabled={spawningKey !== null}
-          aria-busy={spawningKey !== null}
-          onClick={() => spawn("startWork", repo, number)}
-        >
-          {spawningKey !== null ? <Spinner className="size-3" /> : null}
-          {spawningKey !== null ? "Starting…" : "Send agent"}
-        </Button>
-      </div>
+        <span>Issue</span>
+      </WorkItemHeading>
 
-      <div className="flex flex-col gap-6 lg:flex-row">
-        <div className="flex min-w-0 flex-1 flex-col gap-4">
-          <div className="overflow-hidden rounded-lg border border-border bg-card">
-            <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
+      <div className="gh-detail-layout">
+        <div className="gh-detail-main">
+          <div className="gh-description">
+            <div className="gh-description-author">
               <Avatar login={detail.author} />
               <span className="font-medium text-foreground">
                 {detail.author}
               </span>
-              opened this issue · updated {relativeTime(detail.updatedAt)}
+              <span className="gh-description-updated">Updated {relativeTime(detail.updatedAt)}</span>
             </div>
-            <div className="p-4">
+            <div className="gh-description-body">
               {detail.body.length > 0 ? (
-                <Markdown content={detail.body} className="text-sm" />
+                <Markdown content={detail.body} className="gh-prose" />
               ) : (
                 <p className="text-sm text-muted-foreground">
-                  (no description)
+                  No description provided.
                 </p>
               )}
             </div>
           </div>
 
           {detail.comments.length > 0 ? (
-            <div className="flex flex-col gap-2">
+            <div className="gh-discussion">
               <h3 className="text-xs font-semibold text-muted-foreground">
-                Activity · {detail.comments.length}
+                Discussion <span className="gh-count">{detail.comments.length}</span>
               </h3>
               {detail.comments.map((entry, index) => (
                 <div
                   key={index}
-                  className="rounded-lg border border-border bg-card p-3"
+                  className="gh-discussion-entry"
                 >
-                  <p className="mb-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+                  <p className="gh-comment-author">
                     <Avatar login={entry.author} />
                     <span className="font-medium text-foreground">
                       {entry.author}
                     </span>{" "}
                     · {relativeTime(entry.createdAt)}
                   </p>
-                  <Markdown content={entry.body} className="text-sm" />
+                  <Markdown content={entry.body} className="gh-prose" />
                 </div>
               ))}
             </div>
           ) : null}
 
-          <div className="flex flex-col gap-2">
+          <div className="gh-comment-form">
+            <label htmlFor="github-issue-comment">Add a comment</label>
             <Textarea
+              id="github-issue-comment"
               value={comment}
               onChange={(event) => setComment(event.target.value)}
               onKeyDown={(event) => submitCommentOnModEnter(event, postComment)}
@@ -1904,7 +1838,8 @@ function IssueDetailView({
               title="Press Ctrl or ⌘ + Enter to post"
               rows={3}
             />
-            <div className="flex justify-end">
+            <div className="gh-comment-footer">
+              <span>Markdown supported</span>
               <Button
                 size="sm"
                 className="gap-1.5"
@@ -1919,7 +1854,7 @@ function IssueDetailView({
           </div>
         </div>
 
-        <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+        <aside className="gh-detail-sidebar">
           <div className="flex flex-col gap-2">
             <SidebarHeading>Status</SidebarHeading>
             <Select
@@ -2289,16 +2224,16 @@ function PullTimeline({ pull }: { pull: PullDetail }) {
   }, [pull]);
   if (entries.length === 0 && pull.reviewThreads.length === 0) return null;
   return (
-    <div className="flex flex-col gap-2">
+    <div className="gh-discussion">
       <h3 className="text-xs font-semibold text-muted-foreground">
-        Activity · {entries.length + pull.reviewThreads.length}
+        Discussion <span className="gh-count">{entries.length + pull.reviewThreads.length}</span>
       </h3>
       {entries.map((entry, index) => (
         <div
           key={index}
-          className="rounded-lg border border-border bg-card p-3"
+          className="gh-discussion-entry"
         >
-          <p className="mb-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+          <p className="gh-comment-author">
             <Avatar login={entry.author} />
             <span className="font-medium text-foreground">{entry.author}</span>
             {entry.type === "review" ? (
@@ -2309,7 +2244,7 @@ function PullTimeline({ pull }: { pull: PullDetail }) {
             · {relativeTime(entry.createdAt)}
           </p>
           {entry.body.length > 0 ? (
-            <Markdown content={entry.body} className="text-sm" />
+            <Markdown content={entry.body} className="gh-prose" />
           ) : null}
         </div>
       ))}
@@ -2383,8 +2318,10 @@ function PullCommentBox({
       .finally(() => setPosting(false));
   }, [rpc, repo, number, comment, onPosted]);
   return (
-    <div className="flex flex-col gap-2">
+    <div className="gh-comment-form">
+      <label htmlFor="github-pull-comment">Add a comment</label>
       <Textarea
+        id="github-pull-comment"
         value={comment}
         onChange={(event) => setComment(event.target.value)}
         onKeyDown={(event) => submitCommentOnModEnter(event, post)}
@@ -2392,7 +2329,8 @@ function PullCommentBox({
         title="Press Ctrl or ⌘ + Enter to post"
         rows={3}
       />
-      <div className="flex justify-end">
+      <div className="gh-comment-footer">
+        <span>Markdown supported</span>
         <Button
           size="sm"
           className="gap-1.5"
@@ -2423,7 +2361,6 @@ function PullDetailView({
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const { links, error: linksError, refetch: retryLinks } = useLinks();
-  const { spawn, spawningKey } = useSpawn();
   const [pull, setPull] = useState<PullDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -2483,20 +2420,20 @@ function PullDetailView({
 
   const pullLinks = links[`pr:${repo}#${number}`];
   const mainColumn = (
-    <div className="flex min-w-0 flex-1 flex-col gap-4">
+    <div className="gh-detail-main">
       <ChecksSection checks={pull.checks} />
 
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
+      <div className="gh-description">
+        <div className="gh-description-author">
           <Avatar login={pull.author} />
           <span className="font-medium text-foreground">{pull.author}</span>
-          opened this pull request · updated {relativeTime(pull.updatedAt)}
+          <span className="gh-description-updated">Updated {relativeTime(pull.updatedAt)}</span>
         </div>
-        <div className="p-4">
+        <div className="gh-description-body">
           {pull.body.length > 0 ? (
-            <Markdown content={pull.body} className="text-sm" />
+            <Markdown content={pull.body} className="gh-prose" />
           ) : (
-            <p className="text-sm text-muted-foreground">(no description)</p>
+            <p className="text-sm text-muted-foreground">No description provided.</p>
           )}
         </div>
       </div>
@@ -2515,7 +2452,7 @@ function PullDetailView({
   );
 
   return (
-    <div className="flex flex-col gap-4" aria-busy={loading}>
+    <div className="gh-detail gh-stack" data-compact={compact || undefined} aria-busy={loading}>
       {loading ? <RefreshBar visible /> : null}
       {error !== null ? (
         <div
@@ -2529,54 +2466,19 @@ function PullDetailView({
         </div>
       ) : null}
       <LinkErrorNotice error={linksError} onRetry={retryLinks} />
-      <div className="flex items-center gap-1 text-xs text-muted-foreground">
-        {onBack !== undefined ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 px-2"
-            onClick={onBack}
-          >
-            ← {backLabel}
-          </Button>
-        ) : null}
-        <span className="min-w-0 truncate">
-          {repo} · #{number}
-        </span>
-        <span className="flex-1" />
-        <SafeUrlLink
-          href={pull.url}
-          className="shrink-0 underline hover:text-foreground"
-        >
-          Open on GitHub ↗
-        </SafeUrlLink>
-      </div>
-
-      <div className="flex items-start gap-3">
-        <h2
-          className={`min-w-0 flex-1 font-semibold text-foreground ${compact ? "text-base" : "text-xl"}`}
-        >
-          {pull.title}{" "}
-          <span className="font-normal text-muted-foreground">
-            #{pull.number}
-          </span>
-        </h2>
-        <Button
-          size="sm"
-          className="gap-1.5"
-          disabled={spawningKey !== null}
-          aria-busy={spawningKey !== null}
-          onClick={() => spawn("startReview", repo, number)}
-        >
-          {spawningKey !== null ? <Spinner className="size-3" /> : null}
-          {spawningKey !== null ? "Starting…" : "Review with agent"}
-        </Button>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      <WorkItemHeading
+        title={pull.title}
+        number={pull.number}
+        repo={repo}
+        onBack={onBack}
+        backLabel={backLabel}
+        source={<SafeUrlLink href={pull.url}>Open on GitHub <Icon name="ExternalLink" aria-hidden="true" /></SafeUrlLink>}
+        action={<AskAgent kind="pr" repo={repo} number={number} />}
+      >
         <PullStateBadge state={pull.state} />
         <ReviewDecisionBadge decision={pull.reviewDecision} />
-        <span className="font-mono">
+        <span className="gh-branch-context">
+          <Icon name="GitBranch" aria-hidden="true" />
           {pull.baseRefName} ← {pull.headRefName}
         </span>
         <span>
@@ -2590,14 +2492,14 @@ function PullDetailView({
         </span>
         <LabelChips labels={pull.labels} className="flex flex-wrap" />
         <ThreadPills links={pullLinks} />
-      </div>
+      </WorkItemHeading>
 
       {compact ? (
         mainColumn
       ) : (
-        <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="gh-detail-layout">
           {mainColumn}
-          <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+          <aside className="gh-detail-sidebar">
             <div className="flex flex-col gap-1">
               <SidebarHeading>Reviewers</SidebarHeading>
               <PullReviewersList pull={pull} />
@@ -2902,28 +2804,19 @@ function NewIssueForm({
   }, [rpc, repo, title, body, onCreated]);
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
-      <div className="flex items-start gap-3">
-        <Button size="sm" variant="ghost" className="h-8 shrink-0 px-2" onClick={onCancel} aria-label="Back to issues">
-          ← Issues
-        </Button>
-        <div className="min-w-0">
-          <h2 className="text-lg font-semibold text-foreground">New issue</h2>
-          <p className="mt-0.5 text-sm text-muted-foreground">Create an issue in one of your tracked repositories.</p>
-        </div>
-      </div>
+    <div className="gh-new-issue gh-stack">
+      <Button size="sm" variant="ghost" className="gh-back" onClick={onCancel} aria-label="Back to issues">
+        <Icon name="ArrowLeft" aria-hidden="true" />Inbox
+      </Button>
+      <PageHeading title="New issue" description="Describe the problem, question, or idea you want to work on." />
       <form
-        className="overflow-hidden rounded-xl border border-border bg-card shadow-sm"
+        className="gh-issue-form"
         onSubmit={(event) => {
           event.preventDefault();
           create();
         }}
       >
-        <div className="border-b border-border bg-muted/50 px-4 py-3 md:px-5">
-          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Issue details</p>
-          <p className="mt-1 text-sm text-muted-foreground">Add enough context for someone else to understand and act on the problem.</p>
-        </div>
-        <div className="flex flex-col gap-5 p-4 md:p-5">
+        <div className="gh-form-fields">
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-2">
               <label htmlFor="github-new-issue-repo" className="text-sm font-medium text-foreground">Repository</label>
@@ -2942,7 +2835,7 @@ function NewIssueForm({
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-2">
               <label htmlFor="github-new-issue-title" className="text-sm font-medium text-foreground">Title</label>
-              <span className="text-xs text-muted-foreground">{title.length} characters</span>
+
             </div>
             <Input
               id="github-new-issue-title"
@@ -2955,7 +2848,7 @@ function NewIssueForm({
               aria-invalid={title.length > 0 && title.trim().length === 0}
               className="h-10 rounded-lg px-3 py-2"
             />
-            <p id="github-new-issue-title-help" className="text-xs text-muted-foreground">Keep it short and specific so it is easy to scan in the issue list.</p>
+            <p id="github-new-issue-title-help" className="text-xs text-muted-foreground">A short, specific title is easier to find later.</p>
           </div>
           <div className="flex flex-col gap-1.5">
             <label htmlFor="github-new-issue-description" className="text-sm font-medium text-foreground">Description</label>
@@ -2968,10 +2861,10 @@ function NewIssueForm({
               aria-describedby="github-new-issue-description-help"
               className="min-h-48 resize-y rounded-lg leading-snug"
             />
-            <p id="github-new-issue-description-help" className="text-xs text-muted-foreground">Markdown is supported. You can add more detail after the issue is created.</p>
+            <p id="github-new-issue-description-help" className="text-xs text-muted-foreground">Include what happened, what you expected, and steps to reproduce. Markdown supported.</p>
           </div>
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3 md:px-5">
+        <div className="gh-form-footer">
           <div className="min-w-0">
             <p className="text-xs text-muted-foreground">
               {repo.length === 0 ? "Select a repository to continue." : title.trim().length === 0 ? "Add a title to continue." : "Ready to create this issue."}
@@ -3136,8 +3029,8 @@ function GithubPanel({ subPath }: PluginNavPanelProps) {
   }, [tab]);
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
-      <div className="mx-auto w-full max-w-5xl space-y-4">
+    <div className="gh-workspace min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
+      <div className="gh-shell space-y-4">
         {statusError !== null && status === null ? (
           <div role="alert" className="rounded-lg border border-border bg-card">
             <EmptyState
@@ -3354,7 +3247,7 @@ function AddRepositoryForm() {
   );
   return (
     <form
-      className="flex flex-col gap-2 border-b border-border p-3 @[48rem]:flex-row @[48rem]:items-center"
+      className="gh-add-repo"
       onSubmit={submit}
     >
       <label htmlFor="github-add-repository" className="sr-only">
@@ -3381,7 +3274,7 @@ function AddRepositoryForm() {
       ) : null}
       <Button size="sm" type="submit" className="h-9 gap-1.5 @[48rem]:shrink-0" disabled={adding || value.trim().length === 0} aria-busy={adding}>
         {adding ? <Spinner className="size-3" /> : null}
-        {adding ? "Adding…" : "Add"}
+        {adding ? "Adding…" : <><Icon name="Plus" aria-hidden="true" />Add</>}
       </Button>
     </form>
   );
@@ -3482,7 +3375,7 @@ function RepositoryManager({
         />
       ) : null}
       {status.repos.length > 0 ? (
-        <div className="relative border-b border-border px-4 py-3">
+        <div className="gh-repo-search">
           <label htmlFor="github-tracked-repository-search" className="sr-only">
             Search tracked repositories
           </label>
@@ -3496,7 +3389,7 @@ function RepositoryManager({
             className="h-9 pl-9"
           />
           <p className="mt-1.5 text-xs text-muted-foreground">
-            Search by owner or repository. Select a repository to filter this view.
+            Select a repository to focus your Inbox.
           </p>
         </div>
       ) : null}
@@ -3505,7 +3398,7 @@ function RepositoryManager({
           No repositories yet. Add an owner/repo above or attach a BB project with a GitHub origin.
         </p>
       ) : (
-        <div className="divide-y divide-border">
+        <div className="gh-repo-results">
           {visibleRepos.length === 0 ? (
             <div className="flex items-center justify-between gap-3 px-4 py-3" role="status">
               <p className="text-sm text-muted-foreground">
@@ -3532,7 +3425,7 @@ function RepositoryManager({
               ? health.error
               : null;
             return (
-              <div key={entry.repo} className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-accent/50 @[64rem]:flex-row @[64rem]:items-center">
+              <div key={entry.repo} className="gh-repo-row">
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className={"size-2 shrink-0 rounded-full " + dot} title={repoHealthText(health)} aria-hidden="true" />
@@ -3551,21 +3444,21 @@ function RepositoryManager({
                     <p className="mt-1 truncate text-xs text-red-600 dark:text-red-400" title={health.error}>{health.error}</p>
                   ) : null}
                 </div>
-                <div className="grid w-full max-w-[24rem] grid-cols-3 gap-2 @[64rem]:w-64 @[64rem]:max-w-none @[64rem]:shrink-0">
+                <div className="gh-repo-counts">
                   {[
                     { count: issueCount, label: "Issues", countLoading: loading },
                     { count: pullRequestCount, label: "PRs", countLoading: loading },
                     { count: alertCount, label: "Alerts", countLoading: loading },
                   ].map(({ count, label, countLoading }) => (
-                    <div key={label} className="min-w-0 rounded-md border border-border bg-muted/50 px-2 py-1.5 text-center">
-                      <span className="block text-sm font-medium text-foreground">
+                    <div key={label} className="gh-repo-count">
+                      <span className="gh-repo-number">
                         {count === null ? (countLoading ? <Skeleton className="mx-auto h-4 w-6" /> : "—") : count}
                       </span>
-                      <span className="block whitespace-nowrap text-[11px] text-muted-foreground">{label}</span>
+                      <span className="gh-repo-count-label">{label}</span>
                     </div>
                   ))}
                 </div>
-                <div className="flex shrink-0 items-center justify-end gap-1">
+                <div className="gh-repo-actions">
                   <Button size="sm" variant="ghost" className="h-8 gap-1.5 px-2" disabled={busy !== null} aria-busy={busy === entry.repo} onClick={() => run(entry.repo, () => rpc.call("refreshRepository", { repo: entry.repo }))} aria-label={`Refresh ${entry.repo}`} title={`Refresh ${entry.repo}`}>
                     {busy === entry.repo ? <Spinner className="size-3" /> : null}
                     {busy === entry.repo ? "Syncing…" : "Refresh"}
@@ -3585,40 +3478,6 @@ function RepositoryManager({
   );
 }
 
-function repoHealthSummary(status: Status | null): string {
-  if (status === null) return "not synced";
-  return summarizeRepoHealth(status.repos.map((entry) => entry.health.status));
-}
-
-function RepoHealthDots({ status }: { status: Status | null }) {
-  const groups =
-    status === null || status.repos.length === 0
-      ? [{ tone: "muted" as const, count: 0 }]
-      : repoHealthColorCounts(status.repos.map((entry) => entry.health.status));
-  return (
-    <span className="flex items-center gap-1.5" aria-hidden="true">
-      {groups.map((group) => (
-        <span key={group.tone} className="inline-flex items-center gap-1">
-          <span
-            className={
-              "size-2 rounded-full " +
-              repoHealthDotClass(
-                group.tone === "muted"
-                  ? "never"
-                  : group.tone === "healthy"
-                    ? "healthy"
-                    : group.tone === "syncing"
-                      ? "syncing"
-                      : "failed",
-              )
-            }
-          />
-        </span>
-      ))}
-    </span>
-  );
-}
-
 function ReposDrawer({
   status,
   onSelectRepo,
@@ -3627,8 +3486,8 @@ function ReposDrawer({
   onSelectRepo: (repo: string) => void;
 }) {
   return (
-    <section className="overflow-hidden rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-2.5">
+    <section className="gh-repository-manager">
+      <div className="gh-repo-heading">
         <div className="min-w-0">
           <h2 className="text-sm font-semibold text-foreground">Tracked repositories</h2>
           <p className="text-xs text-muted-foreground">
@@ -4187,7 +4046,7 @@ function DependabotDetailView({
   const displayDate = (value: string) => relativeTime(value) || value || "—";
 
   return (
-    <div className="flex flex-col gap-5" aria-busy={loading}>
+    <div className="gh-detail gh-security-detail gh-stack" aria-busy={loading}>
       {loading ? <RefreshBar visible /> : null}
       {error !== null ? (
         <div
@@ -4200,56 +4059,31 @@ function DependabotDetailView({
           </Button>
         </div>
       ) : null}
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
-          ← Dependabot
-        </Button>
-        <span className="min-w-0 truncate">{repo} · alert #{number}</span>
-        <span className="flex-1" />
-        <SafeUrlLink href={alert.htmlUrl} className="shrink-0 underline hover:text-foreground">
-          Open on GitHub ↗
-        </SafeUrlLink>
-      </div>
-      <section className="rounded-xl border border-border bg-card p-4">
-        <div className="flex flex-col gap-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="outline" className="capitalize">Dependabot alert</Badge>
-            <Badge variant="secondary" className="gap-1.5 capitalize">
-              <span className={"size-2 rounded-full " + (alert.state.toLowerCase() === "open" ? "bg-green-500" : "bg-muted-foreground/50")} aria-hidden="true" />
-              {alert.state}
-            </Badge>
-            <span className={"inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium uppercase " + severityClass(advisorySeverity)}>
-              <span className={"size-2 rounded-full " + severityDotClass(advisorySeverity)} aria-hidden="true" />
-              {advisorySeverity}
-            </span>
-          </div>
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="min-w-0 flex-1">
-              <p className="text-xs uppercase tracking-wider text-muted-foreground">
-                {alert.packageName} · {alert.ecosystem}
-              </p>
-              <h2 className="break-words text-xl font-semibold tracking-tight text-foreground">
-                {alert.packageName}
-              </h2>
-              <p className="mt-1 max-w-3xl text-sm leading-snug text-muted-foreground">
-                {alert.summary || "No advisory summary provided."}
-              </p>
-            </div>
-            <div className="shrink-0 rounded-lg bg-muted/50 px-3 py-2 text-right">
-              <p className="font-mono text-sm font-medium text-foreground">#{alert.number}</p>
-              <p className="text-xs text-muted-foreground">in {repo}</p>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {alert.ghsaId.length > 0 ? <Badge variant="secondary" className="font-mono font-normal">{alert.ghsaId}</Badge> : null}
-            {alert.cveId !== null ? <Badge variant="secondary" className="font-mono font-normal">{alert.cveId}</Badge> : null}
-            {alert.classification.length > 0 ? <Badge variant="secondary" className="capitalize">{alert.classification}</Badge> : null}
-          </div>
-        </div>
-      </section>
-      <div className="flex flex-col gap-5 @[48rem]:flex-row">
-        <main className="flex min-w-0 flex-col gap-5 @[48rem]:flex-1">
-          <section className="overflow-hidden rounded-xl border border-border bg-card">
+      <WorkItemHeading
+        title={alert.summary || alert.packageName}
+        number={alert.number}
+        repo={repo}
+        onBack={onBack}
+        source={<SafeUrlLink href={alert.htmlUrl}>Open on GitHub <Icon name="ExternalLink" aria-hidden="true" /></SafeUrlLink>}
+        action={<AskAgent kind="security" repo={repo} number={number} />}
+      >
+        <Badge variant="outline" className="capitalize">Dependabot alert</Badge>
+        <Badge variant="secondary" className="gap-1.5 capitalize">
+          <span className={"size-2 rounded-full " + (alert.state.toLowerCase() === "open" ? "bg-green-500" : "bg-muted-foreground/50")} aria-hidden="true" />
+          {alert.state}
+        </Badge>
+        <span className={"gh-severity " + severityClass(advisorySeverity)}>
+          <span className={"size-2 rounded-full " + severityDotClass(advisorySeverity)} aria-hidden="true" />
+          {advisorySeverity}
+        </span>
+        <span className="gh-package-context"><Icon name="PackageReceive" aria-hidden="true" />{alert.packageName} / {alert.ecosystem}</span>
+        {alert.ghsaId.length > 0 ? <Badge variant="secondary" className="font-normal">{alert.ghsaId}</Badge> : null}
+        {alert.cveId !== null ? <Badge variant="secondary" className="font-normal">{alert.cveId}</Badge> : null}
+        {alert.classification.length > 0 ? <Badge variant="secondary" className="capitalize">{alert.classification}</Badge> : null}
+      </WorkItemHeading>
+      <div className="gh-detail-layout">
+        <main className="gh-detail-main">
+          <section className="gh-detail-section">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-3">
               <div>
                 <h3 className="text-sm font-medium text-foreground">Affected versions</h3>
@@ -4278,11 +4112,11 @@ function DependabotDetailView({
                       <p className="mt-0.5 text-xs text-muted-foreground">{entry.ecosystem}</p>
                     </div>
                     <div className="min-w-0 @[48rem]:flex-1">
-                      <p className="hidden mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground @[48rem]:block">Affected range</p>
+                      <p className="gh-version-label">Affected range</p>
                       <p className="font-mono text-xs text-foreground">{entry.vulnerableVersionRange || "—"}</p>
                     </div>
                     <div className="@[48rem]:w-24 @[48rem]:text-right">
-                      <p className="hidden mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground @[48rem]:block">First patched</p>
+                      <p className="gh-version-label">First patched</p>
                       <p className={entry.firstPatchedVersion !== null ? "font-medium text-foreground" : "text-sm text-muted-foreground"}>
                         {entry.firstPatchedVersion ?? "No fix available"}
                       </p>
@@ -4292,17 +4126,17 @@ function DependabotDetailView({
               </div>
             )}
           </section>
-          <section className="overflow-hidden rounded-xl border border-border bg-card">
+          <section className="gh-detail-section">
             <div className="border-b border-border bg-muted/50 px-4 py-3">
               <h3 className="text-sm font-medium text-foreground">Advisory description</h3>
               <p className="mt-0.5 text-xs text-muted-foreground">Why this dependency is flagged</p>
             </div>
             <div className="max-w-3xl p-4">
-              {alert.description.length > 0 ? <Markdown content={alert.description} className="text-sm leading-snug" /> : <p className="text-sm text-muted-foreground">No advisory description provided.</p>}
+              {alert.description.length > 0 ? <Markdown content={alert.description} className="gh-prose" /> : <p className="text-sm text-muted-foreground">No advisory description provided.</p>}
             </div>
           </section>
           {alert.references.length > 0 ? (
-            <section className="overflow-hidden rounded-xl border border-border bg-card">
+            <section className="gh-detail-section">
               <div className="border-b border-border bg-muted/50 px-4 py-3">
                 <h3 className="text-sm font-medium text-foreground">References</h3>
                 <p className="mt-0.5 text-xs text-muted-foreground">{alert.references.length} advisory links</p>
@@ -4315,9 +4149,9 @@ function DependabotDetailView({
             </section>
           ) : null}
         </main>
-        <aside className="flex w-full max-w-full shrink-0 flex-col gap-5 @[48rem]:w-56">
-          <section className="rounded-xl border border-border bg-muted/50 p-4">
-            <h3 className="flex items-center gap-2 text-sm font-medium text-foreground"><span className="size-2 rounded-full bg-green-500" aria-hidden="true" />Remediation</h3>
+        <aside className="gh-detail-sidebar gh-security-sidebar">
+          <section className="gh-remediation" data-fix={patchedVersion !== null}>
+            <h3 className="flex items-center gap-2 text-sm font-medium text-foreground"><span className={"size-2 rounded-full " + (patchedVersion !== null ? "bg-green-500" : "bg-muted-foreground")} aria-hidden="true" />Remediation</h3>
             {patchedVersion !== null ? (
               <div className="mt-3">
                 <p className="text-xs text-muted-foreground">Upgrade to</p>
@@ -4326,7 +4160,7 @@ function DependabotDetailView({
               </div>
             ) : <p className="mt-3 text-sm leading-snug text-muted-foreground">GitHub has not listed a patched version yet.</p>}
           </section>
-          <section className="rounded-xl border border-border bg-card p-4 text-sm">
+          <section className="gh-sidebar-section">
             <h3 className="text-sm font-medium text-foreground">Dependency</h3>
             <dl className="mt-3 space-y-2 text-xs">
               {[['Package', alert.packageName], ['Ecosystem', alert.ecosystem], ['Manifest', alert.dependencyManifestPath || '—'], ['Scope', alert.dependencyScope || '—'], ['Relationship', alert.dependencyRelationship || '—']].map(([label, value]) => (
@@ -4337,7 +4171,7 @@ function DependabotDetailView({
               ))}
             </dl>
           </section>
-          <section className="rounded-xl border border-border bg-card p-4">
+          <section className="gh-sidebar-section">
             <h3 className="text-sm font-medium text-foreground">Scoring</h3>
             <div className="mt-3 flex gap-2">
               {[['CVSS', alert.cvss.score], ['v3', alert.cvssV3.score], ['v4', alert.cvssV4.score]].map(([label, score]) => (
@@ -4354,7 +4188,7 @@ function DependabotDetailView({
               <p className="text-sm text-foreground">EPSS {epss}</p>
             </div>
           </section>
-          <section className="rounded-xl border border-border bg-card p-4">
+          <section className="gh-sidebar-section">
             <h3 className="text-sm font-medium text-foreground">Timeline</h3>
             <div className="mt-3 flex flex-col gap-2.5 border-l border-border pl-3 text-sm">
               <p><span className="text-muted-foreground">Published </span>{displayDate(alert.publishedAt)}</p>
@@ -4367,7 +4201,7 @@ function DependabotDetailView({
               {alert.fixedAt !== null ? <p><span className="text-muted-foreground">Fixed </span>{displayDate(alert.fixedAt)}</p> : null}
             </div>
           </section>
-          <section className="rounded-xl border border-border bg-card p-4">
+          <section className="gh-sidebar-section">
             <h3 className="text-sm font-medium text-foreground">Advisory metadata</h3>
             {alert.assignees.length > 0 ? <div className="mt-3"><p className="text-xs text-muted-foreground">Assignees</p><div className="mt-1 flex flex-wrap gap-1.5">{alert.assignees.map((login) => <Badge key={login} variant="secondary" className="font-normal">{login}</Badge>)}</div></div> : null}
             {alert.identifiers.length > 0 ? <div className="mt-3"><p className="text-xs text-muted-foreground">Identifiers</p><div className="mt-1 flex flex-wrap gap-1.5">{alert.identifiers.map((identifier) => <Badge key={identifier.type + identifier.value} variant="secondary" className="font-mono font-normal">{identifier.type}: {identifier.value}</Badge>)}</div></div> : null}
@@ -4485,19 +4319,26 @@ function GithubPanelBody({
   onRetryStatus: () => void;
 }) {
   const [reposOpen, setReposOpen] = useState(false);
-  const selectRepo = useCallback((repo: string) => {
-    setQuery(`repo:${repo}`);
-    setReposOpen(false);
-  }, [setQuery]);
-  const openItem = useCallback(
-    (itemKind: "issue" | "pr", repo: string, number: number) => {
-      navigate(
-        itemKind === "pr"
-          ? { view: "pull", repo, number }
-          : { view: "issue", repo, number },
-      );
+  const [selectedRepo, setSelectedRepo] = useState(() => {
+    try {
+      return window.localStorage.getItem("github-extended:repository") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const repo =
+    status === null || status.repos.some((entry) => entry.repo === selectedRepo)
+      ? selectedRepo
+      : "";
+  const selectRepo = useCallback(
+    (next: string) => {
+      setSelectedRepo(next);
+      try {
+        window.localStorage.setItem("github-extended:repository", next);
+      } catch {}
+      setQuery(withoutPrefixedTokens(query, ["repo:"]));
     },
-    [navigate],
+    [query, setQuery],
   );
   useEffect(() => {
     if (status !== null && status.repos.length === 0) setReposOpen(true);
@@ -4522,173 +4363,250 @@ function GithubPanelBody({
       />
     );
   }
-  if (route.view === "issue") {
-    return (
-      <IssueDetailView
-        repo={route.repo}
-        number={route.number}
-        onBack={() => navigate({ view: "issues" })}
-      />
-    );
+  const activity =
+    route.view === "activity" ||
+    (route.view === "automation" &&
+      (route.page === "events" || route.page === "audit"));
+  const tab = activity
+    ? "activity"
+    : route.view === "automation"
+      ? "automation"
+      : "inbox";
+  const repos = status?.repos ?? [];
+  const scopedQuery = repo
+    ? `${withoutPrefixedTokens(query, ["repo:"])} repo:${repo}`.trim()
+    : query;
+  let content;
+  switch (route.view) {
+    case "agent":
+      content = (
+        <AgentTaskView
+          key={`${route.kind}:${route.repo}#${route.number}`}
+          repo={route.repo}
+          kind={route.kind}
+          number={route.number}
+          onBack={() => navigate({ view: "inbox" })}
+        />
+      );
+      break;
+    case "issue":
+      content = (
+        <IssueDetailView
+          repo={route.repo}
+          number={route.number}
+          onBack={() => navigate({ view: "inbox" })}
+        />
+      );
+      break;
+    case "pull":
+      content = (
+        <PullDetailView
+          repo={route.repo}
+          number={route.number}
+          backLabel="Inbox"
+          onBack={() => navigate({ view: "inbox" })}
+        />
+      );
+      break;
+    case "dependabot-alert":
+      content = (
+        <DependabotDetailView
+          repo={route.repo}
+          number={route.number}
+          onBack={() => navigate({ view: "inbox" })}
+        />
+      );
+      break;
+    case "new":
+      content = (
+        <NewIssueForm
+          repos={repo ? repos.filter((entry) => entry.repo === repo) : repos}
+          onCreated={(repository, number) =>
+            navigate(
+              number !== null
+                ? { view: "issue", repo: repository, number }
+                : { view: "inbox" },
+            )
+          }
+          onCancel={() => navigate({ view: "inbox" })}
+        />
+      );
+      break;
+    case "activity":
+      content = (
+        <AutomationView
+          status={status}
+          page="events"
+          navigate={navigate}
+          repo={repo}
+        />
+      );
+      break;
+    case "automation":
+      content = (
+        <AutomationView
+          status={status}
+          page={route.page}
+          navigate={navigate}
+          repo={repo}
+        />
+      );
+      break;
+    case "dependabot":
+      content = (
+        <>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate({ view: "inbox" })}
+          >
+            ← Inbox
+          </Button>
+          <DependabotListView
+            query={scopedQuery}
+            setQuery={setQuery}
+            repos={repos}
+            onOpenAlert={(repository, number) =>
+              navigate({ view: "dependabot-alert", repo: repository, number })
+            }
+          />
+        </>
+      );
+      break;
+    case "issues":
+    case "pulls": {
+      const kind = route.view === "pulls" ? "pr" : "issue";
+      content = (
+        <>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate({ view: "inbox" })}
+          >
+            ← Inbox
+          </Button>
+          <ListView
+            kind={kind}
+            query={scopedQuery}
+            setQuery={setQuery}
+            repos={repos}
+            onOpenItem={(repository, number) =>
+              navigate({
+                view: kind === "pr" ? "pull" : "issue",
+                repo: repository,
+                number,
+              })
+            }
+            onNewIssue={
+              kind === "issue" && repos.length > 0
+                ? () => navigate({ view: "new" })
+                : undefined
+            }
+          />
+        </>
+      );
+      break;
+    }
+    default:
+      content = <InboxView repo={repo} repos={repos} navigate={navigate} />;
   }
-  if (route.view === "pull") {
-    return (
-      <PullDetailView
-        repo={route.repo}
-        number={route.number}
-        onBack={() => navigate({ view: "pulls" })}
-      />
-    );
-  }
-
-  if (route.view === "dependabot-alert") {
-    return (
-      <DependabotDetailView
-        repo={route.repo}
-        number={route.number}
-        onBack={() => navigate({ view: "dependabot" })}
-      />
-    );
-  }
-  if (route.view === "new") {
-    return (
-      <NewIssueForm
-        repos={status?.repos ?? []}
-        onCreated={(repo, number) =>
-          navigate(
-            number !== null
-              ? { view: "issue", repo, number }
-              : { view: "issues" },
-          )
-        }
-        onCancel={() => navigate({ view: "issues" })}
-      />
-    );
-  }
-
-  const listTab =
-    route.view === "pulls"
-      ? "pulls"
-      : route.view === "dependabot"
-        ? "dependabot"
-        : route.view === "automation"
-          ? "automation"
-          : "issues";
-  const kind = listTab === "pulls" ? "pr" : "issue";
-  const repoCount = status?.repos.length ?? 0;
-  const refreshing = loading || status?.syncing === true;
-
   return (
     <Tabs
-      value={listTab}
-      onValueChange={(value) => {
+      value={tab}
+      onValueChange={(value) =>
         navigate(
-          value === "pulls"
-            ? { view: "pulls" }
-            : value === "dependabot"
-              ? { view: "dependabot" }
-              : value === "automation"
-                ? { view: "automation", page: "setup" }
-                : { view: "issues" },
-        );
-      }}
+          value === "automation"
+            ? { view: "automation", page: "rules" }
+            : value === "activity"
+              ? { view: "activity" }
+              : { view: "inbox" },
+        )
+      }
     >
-      <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="gh-panel">
+        <div className="gh-toolbar">
           <TabsList>
-            <TabsTrigger value="issues">Issues</TabsTrigger>
-            <TabsTrigger value="pulls">Pull requests</TabsTrigger>
-            <TabsTrigger value="dependabot">Dependabot</TabsTrigger>
-            <TabsTrigger value="automation">Automation</TabsTrigger>
+            <TabsTrigger value="inbox"><Icon name="Mail" aria-hidden="true" />Inbox</TabsTrigger>
+            <TabsTrigger value="automation"><Icon name="Workflow" aria-hidden="true" />Automations</TabsTrigger>
+            <TabsTrigger value="activity"><Icon name="Clock" aria-hidden="true" />Activity</TabsTrigger>
           </TabsList>
-          <div className="flex-1" />
+          <div className="gh-scope"><Icon name="FolderGit" aria-hidden="true" />
+          <select
+            aria-label="Repository scope"
+            className="h-8 max-w-full rounded-md border border-input bg-background px-2 text-xs sm:max-w-64"
+            value={repo}
+            onChange={(event) => selectRepo(event.target.value)}
+          >
+            <option value="">All repositories</option>
+            {repos.map((entry) => (
+              <option key={entry.repo} value={entry.repo}>
+                {entry.repo}
+              </option>
+            ))}
+          </select></div>
           <Button
             size="sm"
-            variant={reposOpen ? "secondary" : "outline"}
-            className="h-auto min-h-8 max-w-full flex-wrap justify-start gap-x-2 gap-y-1 px-3 py-1.5 text-left"
+            variant={reposOpen ? "secondary" : "ghost"}
             aria-expanded={reposOpen}
             aria-controls="github-repos-drawer"
-            aria-busy={refreshing}
-            aria-label={
-              status === null
-                ? refreshing
-                  ? "Loading repositories"
-                  : "Repositories"
-                : `${repoCount} repo${repoCount === 1 ? "" : "s"}, ${repoHealthSummary(status)}${refreshing ? ", refreshing" : ""}`
-            }
-            title={
-              status === null
-                ? refreshing
-                  ? "Loading repositories"
-                  : "Repositories"
-                : refreshing
-                  ? `Refreshing · ${repoHealthSummary(status)}`
-                  : repoHealthSummary(status)
-            }
             onClick={() => setReposOpen((open) => !open)}
           >
-            {refreshing ? <Spinner className="size-3" /> : null}
-            <RepoHealthDots status={status} />
-            <span className="font-medium">
-              {status === null ? "Repositories" : `${repoCount} repo${repoCount === 1 ? "" : "s"}`}
-            </span>
-            {status !== null && repoCount > 0 ? (
-              <span className="text-xs font-normal text-muted-foreground">
-                {repoHealthSummary(status)}
-              </span>
-            ) : null}
+            <Icon name="Settings" aria-hidden="true" />Settings
           </Button>
-          {listTab === "issues" ? (
-            <Button
-              size="sm"
-              className="h-8"
-              disabled={repoCount === 0}
-              title={repoCount === 0 ? "Add a repository first" : undefined}
-              onClick={() => navigate({ view: "new" })}
-            >
-              New issue
-            </Button>
+          {loading || status?.syncing ? (
+            <Spinner
+              className="size-3 text-muted-foreground"
+              aria-label="Refreshing GitHub"
+            />
           ) : null}
         </div>
         {reposOpen ? (
-          <div id="github-repos-drawer">
-            <ReposDrawer status={status} onSelectRepo={selectRepo} />
-          </div>
-        ) : null}
-        <TabsPanel value={listTab}>
-          {listTab === "automation" ? (
-            <AutomationView
+          <section
+            id="github-repos-drawer"
+            className="gh-settings space-y-3"
+          >
+            <ReposDrawer
               status={status}
-              page={route.view === "automation" ? route.page : "setup"}
-              navigate={navigate}
+              onSelectRepo={(repository) => {
+                selectRepo(repository);
+                setReposOpen(false);
+              }}
             />
-          ) : listTab === "dependabot" ? (
-            <DependabotListView
-              query={query}
-              setQuery={setQuery}
-              repos={status?.repos ?? []}
-              onOpenAlert={(repo, number) => navigate({ view: "dependabot-alert", repo, number })}
-            />
-          ) : (
-            <ListView
-              kind={kind}
-              query={query}
-              setQuery={setQuery}
-              repos={status?.repos ?? []}
-              onOpenItem={(repo, number) =>
-                openItem(kind === "pr" ? "pr" : "issue", repo, number)
-              }
-              onNewIssue={
-                kind === "issue" && (status?.repos.length ?? 0) > 0
-                  ? () => navigate({ view: "new" })
-                  : undefined
-              }
-            />
-          )}
-        </TabsPanel>
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">
+                Advanced automation settings
+              </summary>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    navigate({ view: "automation", page: "setup" })
+                  }
+                >
+                  Repository automation
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    navigate({ view: "automation", page: "polling" })
+                  }
+                >
+                  Polling and quota
+                </Button>
+              </div>
+            </details>
+          </section>
+        ) : null}
+        <TabsPanel value={tab}>{content}</TabsPanel>
       </div>
     </Tabs>
   );
+}
+
+function GithubThreadPanel(props: PluginThreadPanelProps) {
+  return <div className="gh-workspace gh-thread-panel"><PullPanelTab {...props} /></div>;
 }
 
 export default definePluginApp((app) => {
@@ -4704,7 +4622,7 @@ export default definePluginApp((app) => {
     id: "pull",
     title: "GitHub+ PR",
     icon: "Github",
-    component: PullPanelTab,
+    component: GithubThreadPanel,
   });
   app.slots.messageDirective({
     id: "github-automation",

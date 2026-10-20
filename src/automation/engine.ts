@@ -47,6 +47,7 @@ import {
   parseGithubRestQuota,
 } from "./quota.js";
 import { matchingRules, rulesUsePaths } from "./rules.js";
+import { ISSUE_POLL_JSON_FIELDS, diffIssueObservation, issueObservationFromPoll, parseIssueSnapshot, type IssuePollSnapshot } from "./issue-poller.js";
 import {
   automationRpcMethods,
   createRuleInputSchema,
@@ -109,6 +110,7 @@ export const AUTOMATION_MIGRATIONS = [
      value TEXT NOT NULL,
      updated_at TEXT NOT NULL
    )`,
+  "CREATE INDEX IF NOT EXISTS automation_jobs_repo_id ON automation_jobs (repo, id DESC)",
 ];
 
 export const AUTOMATION_CHANNEL = "automation-changed";
@@ -140,6 +142,12 @@ export interface AutomationDeps {
     repo: string;
     number: number;
     instructions?: string;
+    signal: AbortSignal;
+  }) => Promise<{ threadId: string; output: string }>;
+  runAgent: (input: {
+    event: NormalisedEvent;
+    ruleName: string;
+    instructions: string;
     signal: AbortSignal;
   }) => Promise<{ threadId: string; output: string }>;
 }
@@ -298,6 +306,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
       // Re-enabling or retargeting starts from a fresh baseline instead of
       // replaying everything that changed while automation was off.
       deleteState(`poll_snapshot:${input.repo}`);
+      deleteState(`issue_poll_snapshot:${input.repo}`);
     }
     audit("repository", input.repo, enabled ? "enabled" : "disabled", `base branch ${baseBranch}`);
     pollWaiter.interrupt();
@@ -312,6 +321,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
       if (tracked.has(repo)) continue;
       db.prepare("DELETE FROM automation_repos WHERE repo = ?").run(repo);
       deleteState(`poll_snapshot:${repo}`);
+      deleteState(`issue_poll_snapshot:${repo}`);
     }
   }
 
@@ -499,7 +509,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
   }
 
   // ------------------------------------------------------------------
-  // Polling: gh pr list for each enabled repository, diffed against the
+  // Polling: gh issue/pr list for each enabled repository, diffed against the
   // stored snapshot; every new transition becomes one durable job.
   // ------------------------------------------------------------------
   const pollWaiter = createWaiter();
@@ -507,7 +517,8 @@ export function createAutomationEngine(deps: AutomationDeps) {
   let skipScheduledPoll = false;
   let pollLock: Promise<{ queued: number; error: string | null }> | null = null;
 
-  async function pollRepository(repository: AutomationRepository): Promise<{ queued: number; events: number; baseline: boolean }> {
+  async function pollRepository(repository: AutomationRepository): Promise<{ queued: number; events: number; baseline: boolean; error: string | null }> {
+    const observedAt = now();
     const fields = POLL_JSON_FIELDS.join(",");
     const [openRaw, recentRaw] = await Promise.all([
       deps.gh(
@@ -534,6 +545,22 @@ export function createAutomationEngine(deps: AutomationDeps) {
     const current = observationFromPoll({ baseSha, pullRequests });
     const previous = parseSnapshot(getState(`poll_snapshot:${repository.repo}`));
     const events = diffRepoObservation(previous, current, repository);
+    let issues: IssuePollSnapshot | null = null;
+    let issueError: string | null = null;
+    try {
+      const outputs = await Promise.all([
+        deps.gh(["issue", "list", "-R", repository.repo, "--state", "closed", "--limit", String(POLL_RECENT_LIMIT), "--search", "sort:updated-desc", "--json", ISSUE_POLL_JSON_FIELDS], 60_000),
+        deps.gh(["issue", "list", "-R", repository.repo, "--state", "open", "--limit", String(POLL_OPEN_LIMIT), "--search", "sort:updated-desc", "--json", ISSUE_POLL_JSON_FIELDS], 60_000),
+      ]);
+      issues = issueObservationFromPoll(outputs, observedAt);
+      events.push(...diffIssueObservation(parseIssueSnapshot(getState(`issue_poll_snapshot:${repository.repo}`)), issues, repository.repo));
+    } catch (error) {
+      const message = errorMessage(error);
+      if (!/disabled issues|issues (?:are |have been )?disabled|issues are not enabled/i.test(message)) {
+        issueError = `Issue polling: ${message}`;
+        audit("poll", repository.repo, "warning", issueError);
+      }
+    }
     const at = now();
     let queued = 0;
     db.transaction(() => {
@@ -548,8 +575,9 @@ export function createAutomationEngine(deps: AutomationDeps) {
         queued += 1;
       }
       setState(`poll_snapshot:${repository.repo}`, JSON.stringify(current.snapshot));
+      if (issues !== null) setState(`issue_poll_snapshot:${repository.repo}`, JSON.stringify(issues));
     })();
-    return { queued, events: events.length, baseline: previous === null };
+    return { queued, events: events.length, baseline: previous === null, error: issueError };
   }
 
   function pollAll(signal: AbortSignal): Promise<{ queued: number; error: string | null }> {
@@ -569,7 +597,8 @@ export function createAutomationEngine(deps: AutomationDeps) {
           try {
             const result = await pollRepository(repository);
             queued += result.queued;
-            status.repositories[repository.repo] = { lastPolledAt: now(), lastError: null, lastQueued: result.queued };
+            status.repositories[repository.repo] = { lastPolledAt: now(), lastError: result.error, lastQueued: result.queued };
+            if (result.error !== null) lastError = result.error;
             audit(
               "poll",
               repository.repo,
@@ -676,12 +705,12 @@ export function createAutomationEngine(deps: AutomationDeps) {
     db.prepare("UPDATE automation_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?").run(status, error, now(), id);
   }
 
-  function latestReviewOutput(jobId: number, ruleId: string): string | null {
+  function latestAgentOutput(jobId: number, ruleId: string, index: number, kind: "bb.review" | "bb.agent"): string | null {
     const row = db
       .prepare(
-        "SELECT output FROM automation_action_runs WHERE job_id = ? AND rule_id = ? AND action_kind = 'bb.review' AND status = 'succeeded' ORDER BY action_index DESC LIMIT 1",
+        "SELECT output FROM automation_action_runs WHERE job_id = ? AND rule_id = ? AND action_index < ? AND action_kind = ? AND status = 'succeeded' ORDER BY action_index DESC LIMIT 1",
       )
-      .get(jobId, ruleId) as { output?: string | null } | undefined;
+      .get(jobId, ruleId, index, kind) as { output?: string | null } | undefined;
     return row?.output ?? null;
   }
 
@@ -720,35 +749,49 @@ export function createAutomationEngine(deps: AutomationDeps) {
           audit("action", subject, "thread", `bb.review thread ${review.threadId} for ${event.repo}#${event.prNumber}`);
           output = review.output;
         }
+      } else if (action === "bb.agent") {
+        const instructions = parameters.agentPrompt?.trim();
+        if (!instructions) throw new Error("Describe what the agent should do");
+        if (dryRun) {
+          output = `dry-run: would start an agent for ${event.kind} on ${event.repo}:\n${instructions}`;
+        } else {
+          const agent = await deps.runAgent({ event, ruleName: rule.name, instructions, signal });
+          audit("action", subject, "thread", `bb.agent thread ${agent.threadId} for ${event.kind} on ${event.repo}`);
+          output = agent.output;
+        }
       } else if (action === "github.comment" || action === "github.review") {
-        if (event.prNumber === undefined) throw new Error(`${action} requires a pull request event`);
-        const review = latestReviewOutput(jobId, rule.id) ?? `Automated GitHub+ action for ${event.kind}.`;
-        const body = renderTemplate(parameters.bodyTemplate || "{{review}}", event, review);
+        const number = event.issueNumber ?? event.prNumber;
+        if (number === undefined) throw new Error(`${action} requires an issue or pull request event`);
+        if (action === "github.review" && event.prNumber === undefined) throw new Error("github.review requires a pull request event");
+        const review = latestAgentOutput(jobId, rule.id, index, "bb.review") ?? `Automated GitHub+ action for ${event.kind}.`;
+        const agent = latestAgentOutput(jobId, rule.id, index, "bb.agent") ?? "";
+        const body = renderTemplate(parameters.bodyTemplate || "{{review}}", event, review, agent);
         if (body.trim().length === 0) throw new Error(`${action} rendered an empty body`);
         if (dryRun) {
-          output = `dry-run: would post ${action === "github.comment" ? "a comment" : "a review comment"} on ${event.repo}#${event.prNumber}:\n${body.slice(0, 2_000)}`;
+          output = `dry-run: would post ${action === "github.comment" ? "a comment" : "a review comment"} on ${event.repo}#${number}:\n${body.slice(0, 2_000)}`;
         } else {
           await deps.gh(
             action === "github.comment"
-              ? ["pr", "comment", String(event.prNumber), "-R", event.repo, "--body", body]
-              : ["pr", "review", String(event.prNumber), "-R", event.repo, "--comment", "--body", body],
+              ? [event.issueNumber !== undefined ? "issue" : "pr", "comment", String(number), "-R", event.repo, "--body", body]
+              : ["pr", "review", String(number), "-R", event.repo, "--comment", "--body", body],
             30_000,
           );
-          output = `${action} posted on ${event.repo}#${event.prNumber}`;
+          output = `${action} posted on ${event.repo}#${number}`;
         }
       } else if (action === "github.label") {
-        if (event.prNumber === undefined) throw new Error("github.label requires a pull request event");
+        const number = event.issueNumber ?? event.prNumber;
+        if (number === undefined) throw new Error("github.label requires an issue or pull request event");
         const label = parameters.label?.trim() || DEFAULT_AUTOMATION_LABEL;
         if (dryRun) {
-          output = `dry-run: would add label "${label}" to ${event.repo}#${event.prNumber}`;
+          output = `dry-run: would add label "${label}" to ${event.repo}#${number}`;
         } else {
           await deps.gh(
-            ["api", "--method", "POST", `repos/${event.repo}/issues/${event.prNumber}/labels`, "-f", `labels[]=${label}`],
+            ["api", "--method", "POST", `repos/${event.repo}/issues/${number}/labels`, "-f", `labels[]=${label}`],
             30_000,
           );
-          output = `label "${label}" added to ${event.repo}#${event.prNumber}`;
+          output = `label "${label}" added to ${event.repo}#${number}`;
         }
-      } else {
+      } else if (action === "checkout.update") {
         const branch = parameters.targetBranch || repository.baseBranch;
         if (repository.checkoutPath === null) {
           throw new Error(`${event.repo} has no local BB project checkout to update`);
@@ -766,6 +809,9 @@ export function createAutomationEngine(deps: AutomationDeps) {
           const pulled = await deps.git(["-C", repository.checkoutPath, "pull", "--ff-only", "origin", branch], 120_000);
           output = [preview, pulled].filter(Boolean).join("\n");
         }
+      } else {
+        const exhaustive: never = action;
+        throw new Error(`Unsupported automation action: ${exhaustive}`);
       }
       db.prepare(
         "UPDATE automation_action_runs SET status = 'succeeded', output = ?, updated_at = ? WHERE job_id = ? AND rule_id = ? AND action_index = ?",
@@ -888,8 +934,14 @@ export function createAutomationEngine(deps: AutomationDeps) {
     return { queued: result.changes };
   }
 
-  function listJobs(limit: number): JobRecord[] {
-    const rows = db.prepare("SELECT * FROM automation_jobs ORDER BY id DESC LIMIT ?").all(limit) as JobRow[];
+  function listJobs(limit: number, pendingOnly = false): JobRecord[] {
+    const rows = (pendingOnly
+      ? db.prepare("SELECT * FROM automation_jobs WHERE status = 'pending_approval' ORDER BY id DESC").all()
+      : db.prepare("SELECT * FROM automation_jobs ORDER BY id DESC LIMIT ?").all(limit)) as JobRow[];
+    return hydrateJobs(rows);
+  }
+
+  function hydrateJobs(rows: JobRow[]): JobRecord[] {
     if (rows.length === 0) return [];
     const placeholders = rows.map(() => "?").join(",");
     const runs = db
@@ -935,6 +987,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
         repo: row.repo,
         kind: (event.kind ?? "pr.opened") as NormalisedEvent["kind"],
         prNumber: typeof event.prNumber === "number" ? event.prNumber : null,
+        issueNumber: typeof event.issueNumber === "number" ? event.issueNumber : null,
         title: typeof event.title === "string" ? event.title : "",
         status: JOB_STATUS_SET.has(row.status) ? (row.status as JobStatus) : "queued",
         attempts: row.attempts,
@@ -948,8 +1001,13 @@ export function createAutomationEngine(deps: AutomationDeps) {
     });
   }
 
-  function listAudit(limit: number): AuditRecord[] {
-    const rows = db.prepare("SELECT * FROM automation_audit ORDER BY id DESC LIMIT ?").all(limit) as Array<{
+  function listAudit(limit: number, jobIds?: number[]): AuditRecord[] {
+    if (jobIds?.length === 0) return [];
+    const subjects = jobIds?.map(String);
+    const placeholders = subjects?.map(() => "?").join(",");
+    const rows = (subjects
+      ? db.prepare(`SELECT * FROM automation_audit WHERE subject IN (${placeholders}) OR substr(subject, 1, instr(subject, '/') - 1) IN (${placeholders}) ORDER BY id DESC LIMIT ?`).all(...subjects, ...subjects, limit)
+      : db.prepare("SELECT * FROM automation_audit ORDER BY id DESC LIMIT ?").all(limit)) as Array<{
       id: number;
       created_at: string;
       kind: string;
@@ -977,7 +1035,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
       repositories: repos,
       enabledRepositoryCount: repos.filter((repository) => repository.enabled).length,
       rules: readRules(),
-      jobs: listJobs(DASHBOARD_JOBS),
+      jobs: [...new Map([...listJobs(DASHBOARD_JOBS), ...listJobs(0, true)].map((job) => [job.id, job])).values()].sort((a, b) => b.id - a.id),
       pendingApprovals: pending.count,
       audit: listAudit(DASHBOARD_AUDIT),
       poll: pollStatus(repos),
@@ -987,8 +1045,26 @@ export function createAutomationEngine(deps: AutomationDeps) {
 
   const handlers: PluginRpcHandlers<typeof automationRpcMethods> = {
     automationDashboard: () => dashboard(),
+    automationListJobs: ({ repo, offset, limit }) => {
+      const where = repo ? "WHERE repo = ?" : "";
+      const parameters = repo ? [repo] : [];
+      const { count } = db.prepare(`SELECT count(*) AS count FROM automation_jobs ${where}`).get(...parameters) as { count: number };
+      const rows = db.prepare(`SELECT * FROM automation_jobs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...parameters, limit, offset) as JobRow[];
+      return { jobs: hydrateJobs(rows), total: count, audit: listAudit(DASHBOARD_AUDIT, rows.map((row) => row.id)) };
+    },
     automationSetRepository: (input) => setRepository(input),
-    automationSaveRules: ({ rules }) => ({ saved: saveRules(rules).length }),
+    automationSaveRules: ({ rules, expectedRules }) => {
+      if (expectedRules && JSON.stringify(readRules()) !== JSON.stringify(expectedRules)) {
+        throw new Error("Automations changed elsewhere. Refresh and review the saved version before saving.");
+      }
+      return { saved: saveRules(rules).length };
+    },
+    automationSetRuleEnabled: ({ id, enabled }) => {
+      const rules = readRules();
+      if (!rules.some((rule) => rule.id === id)) throw new Error("Automation no longer exists. Refresh and try again.");
+      saveRules(rules.map((rule) => rule.id === id ? { ...rule, enabled } : rule));
+      return { ok: true };
+    },
     automationPollNow: () => pollNow(),
     automationSetPolling: ({ enabled, intervalSeconds: seconds, quotaPauseRemaining: remaining }) => {
       if (enabled !== undefined) setState("polling_enabled", enabled ? "1" : "0");

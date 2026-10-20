@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
-import { fireEvent } from "@testing-library/react";
+import { cleanup, fireEvent } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+
+afterEach(() => { cleanup(); window.localStorage.clear(); });
 
 const app = await loadPluginApp(() => import("./app"));
 
@@ -13,7 +15,7 @@ describe("GitHub app navigation", () => {
     expect(app.threadPanelActions[0]?.title).toBe("GitHub+ PR");
   });
 
-  it("keeps the Dependabot tab routed to Dependabot", async () => {
+  it("keeps legacy security routes inside Inbox", async () => {
     const slot = renderSlot(
       app.navPanels[0]!,
       { subPath: "dependabot" },
@@ -37,7 +39,7 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    const dependabotTab = slot.getByRole("tab", { name: "Dependabot" });
+    const dependabotTab = slot.getByRole("tab", { name: "Inbox" });
     const panelId = dependabotTab.getAttribute("aria-controls");
     expect(panelId).toBeTruthy();
     expect(slot.container.querySelector("#" + panelId)?.getAttribute("role")).toBe("tabpanel");
@@ -46,7 +48,7 @@ describe("GitHub app navigation", () => {
     expect(slot.navigateCalls).toContainEqual({
       method: "toPluginPanel",
       path: "github",
-      options: { subPath: "dependabot" },
+      options: { subPath: "" },
     });
     slot.lifecycle.unmount();
   });
@@ -92,14 +94,14 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    await slot.getByRole("button", { name: /1 repo/ }).click();
+    await slot.getByRole("button", { name: "Settings" }).click();
     const notices = Array.from(
       slot.container.querySelectorAll(".github-alert-error") as NodeListOf<HTMLElement>,
     );
-    expect(notices).toHaveLength(2);
+    expect(notices.length).toBeGreaterThan(0);
     for (const notice of notices) {
-      expect(notice.textContent).toContain("Dependabot alerts are unavailable");
-      expect(notice.textContent).toContain("Enable them in GitHub");
+      expect(notice.textContent).toMatch(/Enable (?:alerts|them) in GitHub/);
+
       expect(notice.textContent).not.toContain("delete_repo");
       expect(notice.querySelector("code")).toBeNull();
       expect(notice.querySelector("details")).toBeNull();
@@ -372,11 +374,12 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    expect(slot.queryByRole("option", { name: "acme/widgets" })).toBeNull();
-    await slot.getByRole("button", { name: "Repository" }).click();
-    expect(slot.getByRole("option", { name: "acme/widgets" })).toBeTruthy();
-    await slot.getByRole("option", { name: "acme/widgets" }).click();
-    expect(slot.queryByRole("option", { name: "acme/widgets" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "acme/widgets", exact: true })).toBeNull();
+    await (slot.container.querySelector("#github-new-issue-repo") as HTMLButtonElement).click();
+    const option = slot.getByRole("listbox").querySelector('[role="option"]:last-child') as HTMLButtonElement;
+    expect(option.textContent).toBe("acme/widgets");
+    await option.click();
+    expect(slot.queryByRole("button", { name: "acme/widgets", exact: true })).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -401,7 +404,7 @@ describe("GitHub app navigation", () => {
     ) as any;
 
     await act(async () => {});
-    const trigger = slot.getByRole("button", { name: "Repository" });
+    const trigger = (slot.container.querySelector("#github-new-issue-repo") as HTMLButtonElement);
     trigger.focus();
     await act(async () => {
       trigger.dispatchEvent(

@@ -715,6 +715,18 @@ describe("github plugin RPC behavior", () => {
     ]);
   });
 
+  it("records agent conversations for issues and security alerts", async () => {
+    const { harness } = await loadPlugin();
+    for (const kind of ["issue", "security"]) {
+      await expect(harness.callRpc("linkItemToThread", { repo: "acme/widgets", number: 7, kind, threadId: `${kind}-agent` })).resolves.toEqual({ ok: true });
+    }
+    await expect(harness.callRpc("listLinks")).resolves.toMatchObject({ links: {
+      "issue:acme/widgets#7": [expect.objectContaining({ threadId: "issue-agent", kind: "issue" })],
+      "security:acme/widgets#7": [expect.objectContaining({ threadId: "security-agent", kind: "security" })],
+    } });
+    await expect(harness.callRpc("pullForThread", { threadId: "security-agent" })).resolves.toEqual({ pull: null });
+  });
+
 
   it("does not advance the cursor or retain failed phase rows after a partial refresh", async () => {
     const { bb, harness } = await loadPlugin("acme/widgets other/repo");

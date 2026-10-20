@@ -2,6 +2,14 @@
 // agent tool, and the CLI. Pure data — no Node or browser imports.
 
 export const EVENT_KINDS = [
+  "issue.opened",
+  "issue.edited",
+  "issue.closed",
+  "issue.reopened",
+  "issue.labeled",
+  "issue.unlabeled",
+  "issue.assigned",
+  "issue.unassigned",
   "pr.opened",
   "pr.synchronised",
   "pr.review_requested",
@@ -17,12 +25,21 @@ export type EventKind = (typeof EVENT_KINDS)[number];
 
 export const ACTION_KINDS = [
   "bb.review",
+  "bb.agent",
   "github.comment",
   "github.review",
   "github.label",
   "checkout.update",
 ] as const;
 export type ActionKind = (typeof ACTION_KINDS)[number];
+
+export function isIssueEvent(kind: EventKind): boolean {
+  return kind.startsWith("issue.");
+}
+
+export function supportsIssueEvents(action: ActionKind): boolean {
+  return action !== "bb.review" && action !== "github.review";
+}
 
 export const CONDITION_FIELDS = [
   "base",
@@ -78,6 +95,7 @@ export interface RuleConditionGroup {
 
 export interface RuleActionParameters {
   reviewPrompt?: string;
+  agentPrompt?: string;
   bodyTemplate?: string;
   targetBranch?: string;
   label?: string;
@@ -118,6 +136,7 @@ export interface NormalisedEvent {
   labels: string[];
   files: string[];
   prNumber?: number;
+  issueNumber?: number;
   sha?: string;
   title: string;
   payload: Record<string, unknown>;
@@ -139,6 +158,7 @@ export interface JobRecord {
   repo: string;
   kind: EventKind;
   prNumber: number | null;
+  issueNumber: number | null;
   title: string;
   status: JobStatus;
   attempts: number;
@@ -252,6 +272,14 @@ export const STARTER_RULES: AutomationRule[] = [
 ];
 
 export const EVENT_LABELS: Record<EventKind, { label: string; description: string }> = {
+  "issue.opened": { label: "Issue opened", description: "A new issue is opened." },
+  "issue.edited": { label: "Issue edited", description: "An issue's title or description changes." },
+  "issue.closed": { label: "Issue closed", description: "An issue is closed." },
+  "issue.reopened": { label: "Issue reopened", description: "A closed issue is reopened." },
+  "issue.labeled": { label: "Issue labeled", description: "One or more labels are added to an issue." },
+  "issue.unlabeled": { label: "Issue unlabeled", description: "One or more labels are removed from an issue." },
+  "issue.assigned": { label: "Issue assigned", description: "One or more assignees are added to an issue." },
+  "issue.unassigned": { label: "Issue unassigned", description: "One or more assignees are removed from an issue." },
   "pr.opened": { label: "PR opened", description: "A pull request is opened." },
   "pr.synchronised": { label: "PR updated", description: "New commits land on a pull request." },
   "pr.review_requested": { label: "Review requested", description: "A review is requested on a pull request." },
@@ -277,9 +305,14 @@ export const ACTION_LABELS: Record<
     description: "Start a GitHub+ review thread in an isolated BB worktree and wait for its findings.",
     parameter: "reviewPrompt",
   },
+  "bb.agent": {
+    label: "Run agent",
+    description: "Run your instructions with the event context in an isolated BB worktree.",
+    parameter: "agentPrompt",
+  },
   "github.comment": {
-    label: "Comment on PR",
-    description: "Post a conversation comment on the pull request.",
+    label: "Comment on issue or PR",
+    description: "Post a conversation comment on the issue or pull request.",
     parameter: "bodyTemplate",
   },
   "github.review": {
@@ -288,8 +321,8 @@ export const ACTION_LABELS: Record<
     parameter: "bodyTemplate",
   },
   "github.label": {
-    label: "Add PR label",
-    description: `Apply a label to the pull request (default ${DEFAULT_AUTOMATION_LABEL}).`,
+    label: "Add label",
+    description: `Apply a label to the issue or pull request (default ${DEFAULT_AUTOMATION_LABEL}).`,
     parameter: "label",
   },
   "checkout.update": {
@@ -326,15 +359,18 @@ export const JOB_STATUS_LABELS: Record<
   pending_approval: { label: "Needs approval", tone: "warning" },
   succeeded: { label: "Succeeded", tone: "success" },
   skipped: { label: "No matching rule", tone: "default" },
-  dead_letter: { label: "Dead letter", tone: "danger" },
+  dead_letter: { label: "Failed", tone: "danger" },
 };
 
 export const TEMPLATE_PLACEHOLDERS = [
   "{{review}}",
+  "{{agent}}",
   "{{repo}}",
   "{{owner}}",
   "{{name}}",
   "{{prNumber}}",
+  "{{issueNumber}}",
+  "{{number}}",
   "{{title}}",
   "{{event}}",
   "{{base}}",
@@ -343,19 +379,18 @@ export const TEMPLATE_PLACEHOLDERS = [
   "{{sha}}",
 ] as const;
 
-/** Fill a comment/review body template from an event and the latest review text. */
-export function renderTemplate(template: string, event: NormalisedEvent, review: string): string {
+/** Expand placeholders once, preserving the literal contents of agent output. */
+export function renderTemplate(template: string, event: NormalisedEvent, review: string, agent = ""): string {
   const [owner = "", name = ""] = event.repo.split("/");
-  return template
-    .replaceAll("{{review}}", review)
-    .replaceAll("{{repo}}", event.repo)
-    .replaceAll("{{owner}}", owner)
-    .replaceAll("{{name}}", name)
-    .replaceAll("{{prNumber}}", event.prNumber === undefined ? "" : String(event.prNumber))
-    .replaceAll("{{title}}", event.title)
-    .replaceAll("{{event}}", event.kind)
-    .replaceAll("{{base}}", event.base)
-    .replaceAll("{{head}}", event.head)
-    .replaceAll("{{actor}}", event.actor)
-    .replaceAll("{{sha}}", event.sha ?? "");
+  const values: Record<string, string> = {
+    review, agent, repo: event.repo, owner, name,
+    prNumber: event.prNumber === undefined ? "" : String(event.prNumber),
+    issueNumber: event.issueNumber === undefined ? "" : String(event.issueNumber),
+    number: String(event.issueNumber ?? event.prNumber ?? ""),
+    title: event.title, event: event.kind, base: event.base, head: event.head,
+    actor: event.actor, sha: event.sha ?? "",
+  };
+  return template.replace(/\{\{(\w+)\}\}/g, (placeholder: string, key: string) =>
+    Object.hasOwn(values, key) ? values[key]! : placeholder,
+  );
 }

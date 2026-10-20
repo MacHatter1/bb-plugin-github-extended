@@ -97,7 +97,7 @@ for (const artifact of ["app", "server"]) {
 const app = read("dist/app.js");
 const server = read("dist/server.js");
 const css = read("dist/app.css");
-for (const marker of ["Dependabot", "Tracked repositories", "Saved views", "Files changed", "Review with agent", "Starter templates", "github-automation"]) {
+for (const marker of ["Inbox", "Automations", "Activity", "Create automation", "Dependabot", "Tracked repositories", "Saved views", "Files changed", "Ask agent", "Starter templates", "github-automation"]) {
   if (!app.includes(marker)) fail(`generated app marker missing: ${marker}`);
 }
 for (const marker of ["listDependabotAlerts", "getDependabotAlert", "repo_sync_health", "parseExtraRepos", "automationDashboard", "automation_jobs"]) {
