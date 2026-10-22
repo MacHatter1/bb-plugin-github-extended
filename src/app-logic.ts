@@ -1,3 +1,5 @@
+import type { PullRequestSummary } from "./pull-status.js";
+
 export interface Item {
   repo: string;
   number: number;
@@ -6,10 +8,12 @@ export interface Item {
   state: string;
   author: string;
   labels: string[];
+  labelColors?: Record<string, string>;
   assignees: string[];
   url: string;
   body: string;
   updatedAt: string;
+  pullRequest?: PullRequestSummary;
 }
 
 export function isSafeExternalUrl(value: unknown): value is string {

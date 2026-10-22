@@ -78,6 +78,13 @@ const actionParametersSchema = z
   })
   .strict();
 
+const executionSchema = z.object({
+  providerId: z.string().trim().min(1).max(200),
+  model: z.string().trim().min(1).max(500),
+  reasoningLevel: z.string().trim().min(1).max(100),
+  serviceTier: z.string().trim().min(1).max(100).optional(),
+}).strict();
+
 function validateRuleActions(rule: Pick<z.output<typeof ruleObjectSchema>, "actions" | "events" | "actionParameters">, context: z.RefinementCtx) {
   if (rule.actions.includes("bb.agent") && !rule.actionParameters.agentPrompt) {
     context.addIssue({ code: "custom", path: ["actionParameters", "agentPrompt"], message: "Describe what the agent should do" });
@@ -99,6 +106,7 @@ const ruleObjectSchema = z
     conditionGroups: z.array(conditionGroupSchema).max(20).default([]),
     actions: z.array(z.enum(ACTION_KINDS)).min(1),
     actionParameters: actionParametersSchema.default({}),
+    execution: executionSchema.optional(),
     approvalRequired: z.boolean().default(false),
   })
   .strict();

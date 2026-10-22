@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
-import { cleanup, fireEvent } from "@testing-library/react";
+import { cleanup, fireEvent, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
 afterEach(() => { cleanup(); window.localStorage.clear(); });
@@ -10,6 +10,39 @@ afterEach(() => { cleanup(); window.localStorage.clear(); });
 const app = await loadPluginApp(() => import("./app"));
 
 describe("GitHub app navigation", () => {
+  it("removes and re-adds an issue label while keeping the edit menu open", async () => {
+    let issue = {
+      repo: "acme/widgets", number: 7, title: "Editable issue", state: "OPEN", author: "octocat", body: "",
+      labels: ["bug"], labelColors: { bug: "d73a49" }, assignees: [],
+      url: "https://github.com/acme/widgets/issues/7", updatedAt: "2026-10-22T12:00:00Z", comments: [],
+    };
+    const setLabels = vi.fn((value: unknown) => {
+      const input = value as { labels: string[] };
+      issue = { ...issue, labels: input.labels };
+      return { ok: true, labels: input.labels };
+    });
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "issues/acme/widgets/7" }, { rpc: {
+      status: () => ({ ghOk: true, ghState: "ready", ghError: null, repos: [], lastSyncedAt: null, syncing: false }),
+      getIssue: () => ({ issue }),
+      listLinks: () => ({ links: {} }),
+      repositoryLabels: () => ({ labels: ["bug", "feature"], labelColors: { bug: "d73a49", feature: "a2eeef" } }),
+      setLabels,
+    } });
+    await slot.findByText("Editable issue");
+    const labels = slot.getByRole("heading", { name: "Labels" }).parentElement!.parentElement!;
+    fireEvent.click(within(labels).getByRole("button", { name: "Edit" }));
+    const bug = await slot.findByRole("menuitemcheckbox", { name: /bug/ });
+    expect(bug.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(bug);
+    await vi.waitFor(() => expect(setLabels).toHaveBeenCalledWith({ repo: "acme/widgets", number: 7, labels: [] }));
+    expect(slot.getByRole("menu")).toBeTruthy();
+    expect(bug.getAttribute("aria-checked")).toBe("false");
+    expect(within(labels).getByText("None yet")).toBeTruthy();
+    fireEvent.click(bug);
+    await vi.waitFor(() => expect(setLabels).toHaveBeenLastCalledWith({ repo: "acme/widgets", number: 7, labels: ["bug"] }));
+    expect(bug.getAttribute("aria-checked")).toBe("true");
+  });
+
   it("labels the extended GitHub surfaces distinctly", () => {
     expect(app.navPanels[0]?.title).toBe("GitHub+");
     expect(app.threadPanelActions[0]?.title).toBe("GitHub+ PR");

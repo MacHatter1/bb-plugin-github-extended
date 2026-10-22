@@ -59,6 +59,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ruleSchema, type JobPage } from "./automation/schemas.js";
 import { z } from "zod";
 import { AgentComposer } from "./agent-task.js";
+import { RuleAgentSettings } from "./rule-agent-settings.js";
 import { PageHeading, QuietEmpty } from "./surface-ui.js";
 
 const PANEL_PATH = "github";
@@ -1338,8 +1339,8 @@ function AdvancedRuleEditor({
             </label>
             <p className="text-xs text-muted-foreground">
               Describe the action in plain language. Each matching event starts
-              an agent using the repository project's defaults in a separate
-              worktree, with these instructions and the event context.
+              an agent in a separate worktree, with the rule's agent settings,
+              these instructions, and the event context.
             </p>
             <Textarea
               id={`agent-prompt-${rule.id}`}
@@ -1720,6 +1721,13 @@ function RuleEditor({
           ) : null}
         </>
       ) : null}
+      {rule.actions.some((action) => action === "bb.agent" || action === "bb.review") ? (
+        <RuleAgentSettings
+          value={rule.execution}
+          repo={rule.repos[0] ?? repositories.find((entry) => entry.enabled)?.repo}
+          onChange={(execution) => onChange({ execution })}
+        />
+      ) : null}
       <details onToggle={(event) => setAdvanced(event.currentTarget.open)}>
         <summary className="cursor-pointer text-xs text-muted-foreground">
           Advanced: multiple triggers, actions and conditions
@@ -1819,7 +1827,12 @@ function RulesPage({
   };
   const updateRule = (id: string, patch: Partial<AutomationRule>) =>
     setRules((current) =>
-      current.map((rule) => (rule.id === id ? { ...rule, ...patch } : rule)),
+      current.map((rule) => {
+        if (rule.id !== id) return rule;
+        const next = { ...rule, ...patch };
+        if (next.execution === undefined) delete next.execution;
+        return next;
+      }),
     );
   const nextOrder = () =>
     (rules.length === 0 ? 0 : Math.max(...rules.map((rule) => rule.order))) +

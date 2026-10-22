@@ -19,6 +19,7 @@ let accessDeniedFlag: string;
 let dependabotDisabledFlag: string;
 let dependabotAlertFlag: string;
 let callLog: string;
+let pullListFile: string;
 const originalPath = process.env.PATH;
 
 function ghCalls(): string[] {
@@ -33,13 +34,14 @@ beforeEach(() => {
   dependabotDisabledFlag = join(binDir, "gh-dependabot-disabled");
   dependabotAlertFlag = join(binDir, "gh-dependabot-alert");
   callLog = join(binDir, "gh-calls.log");
+  pullListFile = join(binDir, "pull-list.json");
   const openIssue = JSON.stringify([
     {
       number: 7,
       title: "Cache mutations",
       state: "OPEN",
       author: { login: "alice" },
-      labels: [{ name: "bug" }, { name: "old" }],
+      labels: [{ name: "bug", color: "D73A49" }, { name: "old" }],
       assignees: [{ login: "octocat" }],
       url: "https://github.com/acme/widgets/issues/7",
       body: "Keep the cache synchronized.",
@@ -52,13 +54,21 @@ beforeEach(() => {
       title: "Normalize pull details",
       state: "OPEN",
       author: { login: "bob" },
-      labels: [{ name: "enhancement" }],
+      labels: [{ name: "enhancement", color: "a2eeef" }],
       assignees: [],
       url: "https://github.com/acme/widgets/pull/42",
       body: "Normalize every GitHub shape.",
       updatedAt: "2026-08-19T13:00:00Z",
+      statusCheckRollup: [{ name: "build", status: "COMPLETED", conclusion: "SUCCESS" }],
+      reviewDecision: "REVIEW_REQUIRED",
+      mergeStateStatus: "BLOCKED",
+      headRefName: "feature/widgets",
+      baseRefName: "main",
+      additions: 12,
+      deletions: 3,
     },
   ]);
+  writeFileSync(pullListFile, openPull);
   const openDependabotAlert = JSON.stringify([
     {
       number: 3,
@@ -80,7 +90,7 @@ beforeEach(() => {
     title: "Cache mutations",
     state: "OPEN",
     author: { login: "alice" },
-    labels: [{ name: "bug" }],
+    labels: [{ name: "bug", color: "d73a49" }],
     assignees: [{ login: "octocat" }],
     url: "https://github.com/acme/widgets/issues/7",
     body: "Live issue body.",
@@ -101,7 +111,7 @@ beforeEach(() => {
     headRefName: "feature",
     additions: 12,
     deletions: 3,
-    labels: [{ name: "enhancement" }],
+    labels: [{ name: "enhancement", color: "a2eeef" }],
     assignees: [{ login: "octocat" }],
     reviewDecision: "REVIEW_REQUIRED",
     mergeStateStatus: "BLOCKED",
@@ -208,7 +218,7 @@ case "$*" in
   "issue list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
   "issue list -R other/repo --state open"*) if [ -e "${partialFlag}" ]; then echo "partial sync failure" >&2; exit 1; else printf '%s\\n' '[]'; fi;;
   "issue list -R other/repo --state closed"*) printf '%s\\n' '[]';;
-  "pr list -R acme/widgets --state open"*) printf '%s\n' '${openPull}';;
+  "pr list -R acme/widgets --state open"*) cat "${pullListFile}";;
   "pr list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
   "issue view 7 -R acme/widgets --json labels") printf '%s\n' '{"labels":[{"name":"bug"},{"name":"old"}]}';;
   "issue view 7 -R acme/widgets --json"*) printf '%s\n' '${issueDetail}';;
@@ -239,6 +249,49 @@ async function loadPlugin(extraRepos = "acme/widgets") {
 }
 
 describe("github plugin RPC behavior", () => {
+  it("removes the final labels from GitHub and clears them from the cache", async () => {
+    const { harness } = await loadPlugin();
+    await harness.callRpc("refresh");
+    await expect(harness.callRpc("setLabels", { repo: "acme/widgets", number: 7, labels: [] })).resolves.toEqual({ ok: true, labels: [] });
+    expect(ghCalls()).toContain("issue edit 7 -R acme/widgets --remove-label bug --remove-label old");
+    await expect(harness.callRpc("listItems", { kind: "issue" })).resolves.toMatchObject({ items: [{ labels: [] }] });
+  });
+
+  it("preserves label colours in cached issue/PR lists and live detail responses", async () => {
+    const { harness } = await loadPlugin();
+    await harness.callRpc("refresh");
+    await expect(harness.callRpc("listItems", { kind: "issue" })).resolves.toMatchObject({ items: [{ labels: ["bug", "old"], labelColors: { bug: "d73a49" } }] });
+    await expect(harness.callRpc("listItems", { kind: "pr" })).resolves.toMatchObject({ items: [{ labels: ["enhancement"], labelColors: { enhancement: "a2eeef" } }] });
+    await expect(harness.callRpc("getIssue", { repo: "acme/widgets", number: 7 })).resolves.toMatchObject({ issue: { labelColors: { bug: "d73a49" } } });
+    await expect(harness.callRpc("getPull", { repo: "acme/widgets", number: 42 })).resolves.toMatchObject({ pull: { labelColors: { enhancement: "a2eeef" } } });
+    await harness.callRpc("setLabels", { repo: "acme/widgets", number: 7, labels: ["bug"] });
+    await expect(harness.callRpc("listItems", { kind: "issue" })).resolves.toMatchObject({ items: [{ labels: ["bug"], labelColors: { bug: "d73a49" } }] });
+  });
+
+  it("caches PR status and publishes CI-only changes without a PR detail request", async () => {
+    const { bb, harness } = await loadPlugin();
+    await harness.callRpc("refresh");
+    const beforeReads = ghCalls().length;
+    await expect(harness.callRpc("listItems", { kind: "pr" })).resolves.toMatchObject({ items: [{
+      pullRequest: { checks: [{ name: "build", status: "success" }], reviewDecision: "REVIEW_REQUIRED", headRefName: "feature/widgets", baseRefName: "main", additions: 12, deletions: 3 },
+    }] });
+    expect(ghCalls()).toHaveLength(beforeReads);
+    const pulls = JSON.parse(readFileSync(pullListFile, "utf8"));
+    pulls[0].statusCheckRollup[0].conclusion = "CANCELLED";
+    pulls[0].reviewDecision = "CHANGES_REQUESTED";
+    writeFileSync(pullListFile, JSON.stringify(pulls));
+    const signalsBefore = harness.realtimeSignals.length;
+    await harness.callRpc("refresh");
+    expect(harness.realtimeSignals.slice(signalsBefore)).toContainEqual(expect.objectContaining({ channel: "data-changed", payload: { items: 2 } }));
+    await expect(harness.callRpc("listItems", { kind: "pr" })).resolves.toMatchObject({ items: [{
+      updatedAt: "2026-08-19T13:00:00Z", pullRequest: { checks: [{ status: "failure" }], reviewDecision: "CHANGES_REQUESTED" },
+    }] });
+    expect(ghCalls().some((call) => call.startsWith("pr view"))).toBe(false);
+    bb.storage.database().prepare("UPDATE items SET pull_request = 'corrupt' WHERE kind = 'pr'").run();
+    const list = await harness.callRpc("listItems", { kind: "pr" }) as { items: Array<Record<string, unknown>> };
+    expect(list.items[0]).not.toHaveProperty("pullRequest");
+  });
+
   it("registers a CLI name that does not collide with the built-in GitHub plugin", async () => {
     const { harness } = await loadPlugin();
 

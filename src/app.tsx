@@ -82,6 +82,7 @@ import { Spinner } from "./shared-ui.js";
 import { Tabs, TabsList, TabsPanel, TabsTrigger } from "./shared-ui.js";
 import { Textarea } from "./shared-ui.js";
 import { EmptyState } from "@/components/empty-state";
+import { GithubLabel } from "./github-label.js";
 import { Markdown, SafeUrlLink } from "@/components/markdown-lite";
 import { AutomationDirective, AutomationView } from "./automation-view.js";
 import { InboxView } from "./inbox-view.js";
@@ -142,6 +143,7 @@ interface PullDetail {
   deletions: number;
   changedFiles: number;
   labels: string[];
+  labelColors?: Record<string, string>;
   assignees: string[];
   reviewDecision: string;
   mergeStateStatus: string;
@@ -510,22 +512,18 @@ function ThreadPills({ links }: { links: ThreadLink[] | undefined }) {
 
 function LabelChips({
   labels,
+  labelColors,
   className,
 }: {
   labels: string[];
+  labelColors?: Record<string, string>;
   className?: string;
 }) {
   if (labels.length === 0) return null;
   return (
     <span className={`items-center gap-1 ${className ?? "flex shrink-0"}`}>
       {labels.slice(0, 3).map((label) => (
-        <Badge
-          key={label}
-          variant="secondary"
-          className="font-normal text-muted-foreground"
-        >
-          {label}
-        </Badge>
+        <GithubLabel key={label} name={label} color={labelColors?.[label]} />
       ))}
     </span>
   );
@@ -1029,6 +1027,7 @@ function ItemRow({
           </button>
           <LabelChips
             labels={item.labels}
+            labelColors={item.labelColors}
             className="flex flex-wrap shrink-0"
           />
           <ThreadPills links={links} />
@@ -1466,20 +1465,26 @@ function AssigneePicker({
 function LabelPicker({
   repo,
   labels,
+  labelColors,
+  onColors,
   onToggle,
 }: {
   repo: string;
   labels: string[];
+  labelColors?: Record<string, string>;
+  onColors: (colors: Record<string, string>) => void;
   onToggle: (label: string, enabled: boolean) => void;
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const [available, setAvailable] = useState<string[] | null>(null);
+  const [availableColors, setAvailableColors] = useState<Record<string, string>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
   const requestRef = useRef(0);
 
   useEffect(() => {
     requestRef.current += 1;
     setAvailable(null);
+    setAvailableColors({});
     setLoadError(null);
   }, [repo]);
 
@@ -1491,12 +1496,16 @@ function LabelPicker({
         if (requestId !== requestRef.current) return;
         const list = (result as { labels?: unknown })?.labels;
         setAvailable(Array.isArray(list) ? list.map(String) : []);
+        if (result.labelColors) {
+          setAvailableColors(result.labelColors);
+          onColors(result.labelColors);
+        }
       },
       (error: unknown) => {
         if (requestId === requestRef.current) setLoadError(errorText(error));
       },
     );
-  }, [rpc, repo, available]);
+  }, [rpc, repo, available, onColors]);
 
   const ordered =
     available === null
@@ -1535,7 +1544,7 @@ function LabelPicker({
               onCheckedChange={(checked) => onToggle(label, checked === true)}
               onSelect={(event) => event.preventDefault()}
             >
-              <span className="min-w-0 truncate">{label}</span>
+              <GithubLabel name={label} color={availableColors[label] ?? labelColors?.[label]} />
             </DropdownMenuCheckboxItem>
           ))
         )}
@@ -1729,6 +1738,14 @@ function IssueDetailView({
     [setLabels, repo, number, load, detailKey],
   );
 
+  const updateLabelColors = useCallback((labelColors: Record<string, string>) => {
+    const current = detailRef.current;
+    if (current === null || activeDetailKey.current !== detailKey) return;
+    const next = { ...current, labelColors: { ...current.labelColors, ...labelColors } };
+    detailRef.current = next;
+    setDetail(next);
+  }, [detailKey]);
+
   const postComment = useCallback(() => {
     if (comment.trim().length === 0) return;
     setPosting(true);
@@ -1919,13 +1936,15 @@ function IssueDetailView({
               <LabelPicker
                 repo={repo}
                 labels={detail.labels}
+                labelColors={detail.labelColors}
+                onColors={updateLabelColors}
                 onToggle={toggleLabel}
               />
             </div>
             {detail.labels.length === 0 ? (
               <p className="text-sm text-muted-foreground">None yet</p>
             ) : (
-              <LabelChips labels={detail.labels} className="flex flex-wrap" />
+              <LabelChips labels={detail.labels} labelColors={detail.labelColors} className="flex flex-wrap" />
             )}
           </div>
 
@@ -2490,7 +2509,7 @@ function PullDetailView({
           </span>{" "}
           · {pull.changedFiles} file{pull.changedFiles === 1 ? "" : "s"}
         </span>
-        <LabelChips labels={pull.labels} className="flex flex-wrap" />
+        <LabelChips labels={pull.labels} labelColors={pull.labelColors} className="flex flex-wrap" />
         <ThreadPills links={pullLinks} />
       </WorkItemHeading>
 
@@ -2525,7 +2544,7 @@ function PullDetailView({
               {pull.labels.length === 0 ? (
                 <p className="text-sm text-muted-foreground">None yet</p>
               ) : (
-                <LabelChips labels={pull.labels} className="flex flex-wrap" />
+                <LabelChips labels={pull.labels} labelColors={pull.labelColors} className="flex flex-wrap" />
               )}
             </div>
             {pullLinks !== undefined && pullLinks.length > 0 ? (

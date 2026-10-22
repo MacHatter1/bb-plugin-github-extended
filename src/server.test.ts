@@ -41,6 +41,7 @@ function assertGithubFrontendInference(
         deletions: number;
         changedFiles: number;
         labels: string[];
+        labelColors?: Record<string, string>;
         assignees: string[];
         reviewDecision: string;
         mergeStateStatus: string;
@@ -113,6 +114,8 @@ describe("GitHub RPC contract", () => {
 
     expect(calls).toHaveLength(4);
     expect(calls.filter(([kind]) => kind === "pr")).toHaveLength(2);
+    expect(calls.filter(([kind]) => kind === "pr").every((args) => args.at(-1)?.includes("statusCheckRollup,reviewDecision,mergeStateStatus"))).toBe(true);
+    expect(calls.filter(([kind]) => kind === "issue").every((args) => !args.at(-1)?.includes("statusCheckRollup"))).toBe(true);
     expect(items).toEqual([
       expect.objectContaining({
         repo: "acme/widgets",

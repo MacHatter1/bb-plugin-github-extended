@@ -17,7 +17,27 @@ import {
   type AutomationEngine,
 } from "./automation/engine.js";
 import { runAgentThread } from "./automation/orchestration.js";
+import type { RuleExecution } from "./automation/domain.js";
 import { automationRpcMethods, createRuleInputSchema } from "./automation/schemas.js";
+import { normalisePullChecks, pullRequestSummarySchema } from "./pull-status.js";
+import { encodeGithubLabels, readGithubLabels, storedGithubLabels, type GithubLabels } from "./github-labels.js";
+
+const labelColorsSchema = z.record(z.string(), z.string().regex(/^[a-f\d]{6}$/i)).optional();
+
+function agentExecutionOptions(execution?: RuleExecution) {
+  return {
+    ...execution,
+    executionInputSources: {
+      permissionMode: "explicit" as const,
+      ...(execution ? {
+        providerId: "explicit" as const,
+        model: "explicit" as const,
+        reasoningLevel: "explicit" as const,
+        ...(execution.serviceTier !== undefined ? { serviceTier: "explicit" as const } : {}),
+      } : {}),
+    },
+  };
+}
 
 const SYNC_INTERVAL_MS = 5 * 60_000;
 // Retry cadence while the sync fails for a reason that is not a configuration
@@ -154,10 +174,12 @@ const itemSchema = z
     state: z.string(),
     author: z.string(),
     labels: z.array(z.string()),
+    labelColors: labelColorsSchema,
     assignees: z.array(z.string()),
     url: z.string(),
     body: z.string(),
     updatedAt: z.string(),
+    pullRequest: pullRequestSummarySchema.optional(),
   })
   .strict();
 const syncResultSchema = z
@@ -196,6 +218,7 @@ const pullSchema = z
     deletions: z.number().nonnegative(),
     changedFiles: z.number().int().nonnegative(),
     labels: z.array(z.string()),
+    labelColors: labelColorsSchema,
     assignees: z.array(z.string()),
     reviewDecision: z.string(),
     mergeStateStatus: z.string(),
@@ -314,7 +337,7 @@ export const githubRpcContract = defineRpcContract({
   },
   repositoryLabels: {
     input: z.object({ repo: repoNameSchema }).strict(),
-    output: z.object({ labels: z.array(z.string().min(1)) }).strict(),
+    output: z.object({ labels: z.array(z.string().min(1)), labelColors: labelColorsSchema }).strict(),
   },
   setIssueState: {
     input: itemInputSchema
@@ -349,6 +372,7 @@ export const githubRpcContract = defineRpcContract({
             author: z.string(),
             body: z.string(),
             labels: z.array(z.string()),
+            labelColors: labelColorsSchema,
             assignees: z.array(z.string()),
             url: z.string(),
             updatedAt: z.string(),
@@ -442,8 +466,15 @@ interface GhListEntry {
   title?: unknown;
   state?: unknown;
   isDraft?: unknown;
+  statusCheckRollup?: unknown;
+  reviewDecision?: unknown;
+  mergeStateStatus?: unknown;
+  headRefName?: unknown;
+  baseRefName?: unknown;
+  additions?: unknown;
+  deletions?: unknown;
   author?: { login?: unknown };
-  labels?: Array<{ name?: unknown }>;
+  labels?: Array<{ name?: unknown; color?: unknown }>;
   assignees?: Array<{ login?: unknown }>;
   url?: unknown;
   body?: unknown;
@@ -767,11 +798,20 @@ function toItems(raw: string, repo: string, kind: "issue" | "pr"): CachedItem[] 
           ? "DRAFT"
           : String(entry.state ?? "OPEN"),
       author: String(entry.author?.login ?? ""),
-      labels: (entry.labels ?? []).map((label) => String(label?.name ?? "")),
+      ...readGithubLabels(entry.labels),
       assignees: (entry.assignees ?? []).map((user) => String(user?.login ?? "")),
       url: String(entry.url ?? ""),
       body: typeof entry.body === "string" ? entry.body : "",
       updatedAt: String(entry.updatedAt ?? ""),
+      ...(kind === "pr" ? { pullRequest: {
+        checks: entry.statusCheckRollup === undefined ? null : normalisePullChecks(entry.statusCheckRollup),
+        reviewDecision: String(entry.reviewDecision ?? ""),
+        mergeStateStatus: String(entry.mergeStateStatus ?? ""),
+        headRefName: String(entry.headRefName ?? ""),
+        baseRefName: String(entry.baseRefName ?? ""),
+        additions: Math.max(0, Number(entry.additions) || 0),
+        deletions: Math.max(0, Number(entry.deletions) || 0),
+      } } : {}),
     }));
 }
 
@@ -783,7 +823,7 @@ export async function fetchRepoItems(
 ): Promise<CachedItem[]> {
   const fields = "number,title,state,author,labels,assignees,url,body,updatedAt";
   // Only pull requests carry isDraft; `gh issue list` rejects the field.
-  const prFields = `${fields},isDraft`;
+  const prFields = `${fields},isDraft,statusCheckRollup,reviewDecision,mergeStateStatus,headRefName,baseRefName,additions,deletions`;
   // A repo with GitHub Issues disabled must not abort the whole sync —
   // PRs still exist and should be cached.
   const ghIssuesTolerant = (args: string[]) =>
@@ -1485,6 +1525,7 @@ export default async function plugin(bb: BbPluginApi) {
        error TEXT
      )`,
     ...AUTOMATION_MIGRATIONS,
+    `ALTER TABLE items ADD COLUMN pull_request TEXT`,
   ]);
 
   function parseStringArray(raw: unknown): string[] {
@@ -1498,6 +1539,13 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function rowToItem(row: Record<string, unknown>): CachedItem {
+    let pullRequest;
+    try {
+      pullRequest = row.kind === "pr" && typeof row.pull_request === "string"
+        ? pullRequestSummarySchema.safeParse(JSON.parse(row.pull_request)) : null;
+    } catch {
+      pullRequest = null;
+    }
     return {
       repo: String(row.repo),
       number: Number(row.number),
@@ -1505,11 +1553,12 @@ export default async function plugin(bb: BbPluginApi) {
       title: String(row.title),
       state: String(row.state),
       author: String(row.author),
-      labels: parseStringArray(row.labels),
+      ...storedGithubLabels(row.labels),
       assignees: parseStringArray(row.assignees),
       url: String(row.url),
       body: String(row.body),
       updatedAt: String(row.updated_at),
+      ...(pullRequest?.success ? { pullRequest: pullRequest.data } : {}),
     };
   }
 
@@ -1578,16 +1627,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   function replaceRepoRows(repo: string, items: CachedItem[]): void {
     const insert = db.prepare(
-      `INSERT INTO items (repo, number, kind, title, state, author, labels, assignees, url, body, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO items (repo, number, kind, title, state, author, labels, assignees, url, body, updated_at, pull_request)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     db.transaction(() => {
       db.prepare("DELETE FROM items WHERE repo = ?").run(repo);
       for (const item of items) {
         insert.run(
           item.repo, item.number, item.kind, item.title, item.state,
-          item.author, JSON.stringify(item.labels), JSON.stringify(item.assignees),
-          item.url, item.body, item.updatedAt,
+          item.author, JSON.stringify(encodeGithubLabels(item)), JSON.stringify(item.assignees),
+          item.url, item.body, item.updatedAt, item.pullRequest ? JSON.stringify(item.pullRequest) : null,
         );
       }
     })();
@@ -2022,8 +2071,9 @@ export default async function plugin(bb: BbPluginApi) {
         .run(JSON.stringify(patch.assignees), repo, kind, number);
     }
     if (patch.labels !== undefined) {
+      const labelColors = { ...getCachedItem(kind, repo, number)?.labelColors, ...labelsCache.get(repo)?.value.labelColors };
       db.prepare("UPDATE items SET labels = ? WHERE repo = ? AND kind = ? AND number = ?")
-        .run(JSON.stringify(patch.labels), repo, kind, number);
+        .run(JSON.stringify(encodeGithubLabels({ labels: patch.labels, labelColors })), repo, kind, number);
     }
     bb.realtime.publish("data-changed", {});
   }
@@ -2034,7 +2084,7 @@ export default async function plugin(bb: BbPluginApi) {
     const snapshot = () =>
       JSON.stringify({
         items: db
-          .prepare("SELECT repo, kind, number, updated_at FROM items ORDER BY repo, kind, number")
+          .prepare("SELECT repo, kind, number, state, labels, updated_at, pull_request FROM items ORDER BY repo, kind, number")
           .all(),
         alerts: db
           .prepare("SELECT repo, number, state, severity, package_name, updated_at FROM dependabot_alerts ORDER BY repo, number")
@@ -2351,6 +2401,7 @@ export default async function plugin(bb: BbPluginApi) {
     repo: string,
     number: number,
     extraInstructions?: string,
+    execution?: RuleExecution,
   ): Promise<{ threadId: string }> {
     const prepared = await prepareRepoWrite(repo);
     return withRepoWriteLock(repo, async () => {
@@ -2431,7 +2482,7 @@ export default async function plugin(bb: BbPluginApi) {
       title: `${ref}: ${kind === "pr" ? "Pull request review" : "Issue work"}`.slice(0, 120),
       prompt,
       permissionMode: "accept-edits",
-      executionInputSources: { permissionMode: "explicit" },
+      ...agentExecutionOptions(execution),
     })) as unknown as SpawnedThreadSummary;
     try {
       await addLinkUnsafe({
@@ -2477,7 +2528,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const assignableCache = new Map<string, { users: string[]; fetchedAt: number }>();
-  const labelsCache = new Map<string, { labels: string[]; fetchedAt: number }>();
+  const labelsCache = new Map<string, { value: GithubLabels; fetchedAt: number }>();
 
   async function getAssignableUsers(repo: string): Promise<string[]> {
     const cached = assignableCache.get(repo);
@@ -2494,19 +2545,17 @@ export default async function plugin(bb: BbPluginApi) {
     return users;
   }
 
-  async function getRepoLabels(repo: string): Promise<string[]> {
+  async function getRepoLabels(repo: string): Promise<GithubLabels> {
     const cached = labelsCache.get(repo);
     if (cached !== undefined && Date.now() - cached.fetchedAt < 10 * 60_000) {
-      return cached.labels;
+      return cached.value;
     }
     const raw = await gh(["api", `repos/${repo}/labels?per_page=100`], 15_000);
-    const entries = JSON.parse(raw) as Array<{ name?: unknown }>;
-    const labels = entries
-      .map((entry) => String(entry?.name ?? "").trim())
-      .filter((name) => name.length > 0)
-      .sort((a, b) => a.localeCompare(b));
-    labelsCache.set(repo, { labels, fetchedAt: Date.now() });
-    return labels;
+    const entries = JSON.parse(raw) as Array<{ name?: unknown; color?: unknown }>;
+    const value = readGithubLabels(entries.map((entry) => ({ ...entry, name: String(entry?.name ?? "").trim() })));
+    value.labels.sort((a, b) => a.localeCompare(b));
+    labelsCache.set(repo, { value, fetchedAt: Date.now() });
+    return value;
   }
 
 
@@ -2544,11 +2593,11 @@ export default async function plugin(bb: BbPluginApi) {
         projectId: entry.projectId,
         checkoutPath: repoCheckouts.get(entry.repo) ?? null,
       })),
-    runReview: ({ repo, number, instructions, signal }) =>
+    runReview: ({ repo, number, instructions, execution, signal }) =>
       runAgentThread(
         {
           spawn: async () => {
-            const { threadId } = await spawnOnItem("pr", repo, number, instructions);
+            const { threadId } = await spawnOnItem("pr", repo, number, instructions, execution);
             return { id: threadId };
           },
           wait: (args) => bb.sdk.threads.wait(args),
@@ -2557,7 +2606,7 @@ export default async function plugin(bb: BbPluginApi) {
         },
         { signal },
       ),
-    runAgent: ({ event, ruleName, instructions, signal }) =>
+    runAgent: ({ event, ruleName, instructions, execution, signal }) =>
       runAgentThread(
         {
           spawn: async () => {
@@ -2592,7 +2641,7 @@ export default async function plugin(bb: BbPluginApi) {
                   }, null, 2)),
                 ].join("\n"),
                 permissionMode: "accept-edits",
-                executionInputSources: { permissionMode: "explicit" },
+                ...agentExecutionOptions(execution),
               });
               const number = event.issueNumber ?? event.prNumber;
               if (number !== undefined) {
@@ -2842,7 +2891,7 @@ export default async function plugin(bb: BbPluginApi) {
     /** { repo } → labels available in that repo. */
     async repositoryLabels(input) {
       await requireTrackedRepo(input.repo);
-      return { labels: await getRepoLabels(input.repo) };
+      return await getRepoLabels(input.repo);
     },
 
     /** { repo, number, state: "open"|"closed" } → close or reopen an issue. */
@@ -2946,7 +2995,7 @@ export default async function plugin(bb: BbPluginApi) {
           state: String(detail.state ?? ""),
           author: String(detail.author?.login ?? ""),
           body: typeof detail.body === "string" ? detail.body : "",
-          labels: (detail.labels ?? []).map((label) => String(label?.name ?? "")),
+          ...readGithubLabels(detail.labels),
           assignees: (detail.assignees ?? []).map((user) => String(user?.login ?? "")),
           url: String(detail.url ?? ""),
           updatedAt: String(detail.updatedAt ?? ""),
@@ -3018,29 +3067,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const view = JSON.parse(viewRaw) as GhPullView;
 
-      // CheckRun rows carry status/conclusion; classic StatusContext rows a
-      // single state. Normalize both to one traffic-light value.
-      const checks = (view.statusCheckRollup ?? []).map((entry) => {
-        const conclusion = String(entry.conclusion ?? entry.state ?? "").toUpperCase();
-        const running =
-          entry.conclusion === "" ||
-          ["IN_PROGRESS", "QUEUED", "PENDING", "EXPECTED", "WAITING"].includes(
-            String(entry.status ?? entry.state ?? "").toUpperCase(),
-          );
-        const status: "success" | "failure" | "pending" | "neutral" =
-          conclusion === "SUCCESS"
-            ? "success"
-            : conclusion === "FAILURE" || conclusion === "ERROR" || conclusion === "TIMED_OUT"
-              ? "failure"
-              : running
-                ? "pending"
-                : "neutral";
-        return {
-          name: String(entry.name ?? entry.context ?? "check"),
-          status,
-          url: String(entry.detailsUrl ?? entry.targetUrl ?? ""),
-        };
-      });
+      const checks = normalisePullChecks(view.statusCheckRollup);
 
       interface GhReviewComment {
         id?: unknown;
@@ -3125,7 +3152,7 @@ export default async function plugin(bb: BbPluginApi) {
           additions: Number(view.additions ?? 0),
           deletions: Number(view.deletions ?? 0),
           changedFiles: Number(view.changedFiles ?? files.length),
-          labels: (view.labels ?? []).map((label) => String(label?.name ?? "")),
+          ...readGithubLabels(view.labels),
           assignees: (view.assignees ?? []).map((user) => String(user?.login ?? "")),
           reviewDecision: String(view.reviewDecision ?? ""),
           mergeStateStatus: String(view.mergeStateStatus ?? ""),

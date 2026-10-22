@@ -49,6 +49,7 @@ manual follow-up make it easy to lose context.
 
 See issues, pull requests, high-priority security alerts, and pending approvals.
 Start with **Needs attention**, or switch to **Everything** and filter by type.
+Pull requests show their state icon, CI checks, review decision, branches, and change counts.
 
 </td>
 <td width="50%" valign="top">
@@ -67,6 +68,7 @@ state, assign people, and edit labels using your GitHub permissions.
 
 Match events to ordered rules. Review queued work before it runs, inspect
 outputs, and retry failed jobs from Activity.
+Choose a provider, model, and thinking level per rule, or inherit project defaults.
 
 </td>
 <td valign="top">

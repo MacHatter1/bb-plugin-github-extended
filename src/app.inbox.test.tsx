@@ -156,6 +156,72 @@ const handlers = () => ({
 });
 
 describe("simplified GitHub workflows", () => {
+  it("renders issue and PR labels with their repository colours and a plain fallback", async () => {
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      ...handlers(),
+      listItems: (input: unknown) => {
+        const kind = githubRpcContract.listItems.input.parse(input).kind!;
+        return { items: [{ ...item(kind === "issue" ? 1 : 4, kind), labels: ["bug", "plain"], labelColors: { bug: kind === "issue" ? "00008b" : "fef2c0" } }] };
+      },
+    } });
+    await slot.findByText("issue 1");
+    const issue = slot.getByText("issue 1").closest("li")!;
+    const pull = slot.getByText("pr 4").closest("li")!;
+    expect(within(issue).getByText("bug").style.backgroundColor).toBe("rgb(0, 0, 139)");
+    expect(within(issue).getByText("bug").style.color).toBe("rgb(255, 255, 255)");
+    expect(within(pull).getByText("bug").style.backgroundColor).toBe("rgb(254, 242, 192)");
+    expect(within(pull).getByText("bug").style.color).toBe("rgb(0, 0, 0)");
+    expect(within(issue).getByText("plain").getAttribute("style")).toBeNull();
+  });
+
+  it("uses distinct state icons and displays PR checks, reviews, and branch context", async () => {
+    const pulls: Item[] = ["OPEN", "DRAFT", "CLOSED", "MERGED"].map((state, index) => ({
+      ...item(index + 10, "pr", state),
+      pullRequest: {
+        checks: index === 0 ? [{ name: "build", status: "failure", url: "" }, { name: "test", status: "success", url: "" }]
+          : index === 1 ? [{ name: "build", status: "pending", url: "" }] : [],
+        reviewDecision: index === 0 ? "CHANGES_REQUESTED" : index === 1 ? "REVIEW_REQUIRED" : "APPROVED",
+        mergeStateStatus: index === 0 ? "DIRTY" : "CLEAN",
+        headRefName: "feature/widgets", baseRefName: "main", additions: 24, deletions: 3,
+      },
+    }));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      ...handlers(),
+      listItems: (input: unknown) => ({ items: githubRpcContract.listItems.input.parse(input).kind === "pr" ? pulls : [] }),
+    } });
+    await slot.findByText("pr 10");
+    expect(slot.getByRole("img", { name: "open pull request" }).querySelector('[data-icon="GitPullRequest"]')).toBeTruthy();
+    expect(slot.getByRole("img", { name: "draft pull request" }).querySelector('[data-icon="GitPullRequestDraft"]')).toBeTruthy();
+    const failed = within(slot.getByLabelText("Pull request #10 status"));
+    expect(failed.getByText("CI failing (1/2)")).toBeTruthy();
+    expect(failed.getByText("Changes requested")).toBeTruthy();
+    expect(failed.getByText("Merge conflicts")).toBeTruthy();
+    expect(failed.getByText("feature/widgets → main")).toBeTruthy();
+    expect(failed.getByLabelText("24 additions, 3 deletions")).toBeTruthy();
+    expect(slot.getByText("CI running (1/1)")).toBeTruthy();
+    expect(slot.getByText("Review required")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Everything" }));
+    expect(slot.getByRole("img", { name: "closed pull request" }).querySelector('[data-icon="GitPullRequestClosed"]')).toBeTruthy();
+    expect(slot.getByRole("img", { name: "merged pull request" }).querySelector('[data-icon="GitMerge"]')).toBeTruthy();
+    expect(slot.getAllByText("No checks")).toHaveLength(2);
+    fireEvent.click(failed.getByRole("button", { name: "Checks for pull request #10: CI failing (1/2)" }));
+    expect(slot.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "github", options: { subPath: "pulls/acme/widgets/10" } });
+  });
+
+  it("updates CI badges on realtime refresh and never treats unsynced checks as passing", async () => {
+    let pull = item(20, "pr");
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      ...handlers(),
+      listItems: (input: unknown) => ({ items: githubRpcContract.listItems.input.parse(input).kind === "pr" ? [pull] : [] }),
+    } });
+    await slot.findByText("CI unknown");
+    pull = { ...pull, pullRequest: { checks: [{ name: "build", status: "success", url: "" }], reviewDecision: "APPROVED", mergeStateStatus: "CLEAN", headRefName: "feature", baseRefName: "main", additions: 0, deletions: 0 } };
+    await slot.behavior.emitRealtime("data-changed", {});
+    await slot.findByText("CI passing (1/1)");
+    expect(slot.queryByText("CI unknown")).toBeNull();
+    expect(slot.getByText("Approved")).toBeTruthy();
+  });
+
   it("combines actionable items and approvals, then reveals other states with Everything", async () => {
     const slot = renderSlot(
       app.navPanels[0]!,

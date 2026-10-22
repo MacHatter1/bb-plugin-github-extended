@@ -16,6 +16,8 @@ import {
 import { Button, Input, Skeleton } from "./shared-ui.js";
 import { PageHeading, QuietEmpty } from "./surface-ui.js";
 import { PaginationControls, usePagination } from "./pagination.js";
+import { ItemStateIcon, PullRequestStatus } from "./item-status.js";
+import { GithubLabel } from "./github-label.js";
 
 type InboxType = "all" | "issues" | "pulls" | "security" | "approvals";
 const TYPE_LABELS: Record<InboxType, string> = {
@@ -340,16 +342,7 @@ export function InboxView({
                 key={`${item.kind}:${item.repo}#${item.number}`}
                 className="gh-inbox-row"
               >
-                <span
-                  className="gh-item-icon"
-                  data-kind={item.kind}
-                  data-state={item.state.toUpperCase()}
-                >
-                  <Icon
-                    name={item.kind === "pr" ? "GitPullRequest" : "Circle"}
-                    aria-hidden="true"
-                  />
-                </span>
+                <ItemStateIcon item={item} />
                 <div className="gh-item-content">
                   <button
                     className="gh-item-title"
@@ -371,12 +364,14 @@ export function InboxView({
                     </span>
                     <span className="gh-repo-name">{item.repo}</span>
                     <span>{item.state.toLowerCase()}</span>
+                    {item.author ? <span>by {item.author}</span> : null}
                     {item.labels.slice(0, 2).map((label) => (
-                      <span key={label} className="gh-label">
-                        {label}
-                      </span>
+                      <GithubLabel key={label} name={label} color={item.labelColors?.[label]} />
                     ))}
                   </div>
+                  {item.kind === "pr" ? (
+                    <PullRequestStatus item={item} onOpen={() => navigate({ view: "pull", repo: item.repo, number: item.number })} />
+                  ) : null}
                 </div>
                 <div className="gh-item-actions">
                   <AskAgent

@@ -317,7 +317,25 @@ export function DropdownMenuItem({ children, onSelect, disabled }: { children: R
 
 export function DropdownMenuCheckboxItem({ children, checked, onCheckedChange, onSelect }: { children: ReactNode; checked?: boolean; onCheckedChange?: (checked: boolean) => void; onSelect?: (event: React.MouseEvent) => void }) {
   const menu = useContext(MenuContext);
-  return <button type="button" role="menuitemcheckbox" aria-checked={checked === true} className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" onClick={(event) => { event.stopPropagation(); onSelect?.(event); if (!event.defaultPrevented) { onCheckedChange?.(!checked); menu?.close(); } }}><span className="w-4">{checked ? "✓" : ""}</span>{children}</button>;
+  return (
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={checked === true}
+      className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect?.(event);
+        // Preventing selection keeps a multi-select menu open; it must not
+        // suppress the checkbox change itself.
+        onCheckedChange?.(!checked);
+        if (!event.defaultPrevented) menu?.close();
+      }}
+    >
+      <span className="w-4" aria-hidden="true">{checked ? "✓" : ""}</span>
+      {children}
+    </button>
+  );
 }
 
 export function DropdownMenuLabel({ children }: { children: ReactNode }) { return <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground">{children}</div>; }

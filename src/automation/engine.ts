@@ -21,6 +21,7 @@ import {
   type JobStatus,
   type NormalisedEvent,
   type PollStatus,
+  type RuleExecution,
 } from "./domain.js";
 import {
   POLL_INTERVAL_DEFAULT_SECONDS,
@@ -142,12 +143,14 @@ export interface AutomationDeps {
     repo: string;
     number: number;
     instructions?: string;
+    execution?: RuleExecution;
     signal: AbortSignal;
   }) => Promise<{ threadId: string; output: string }>;
   runAgent: (input: {
     event: NormalisedEvent;
     ruleName: string;
     instructions: string;
+    execution?: RuleExecution;
     signal: AbortSignal;
   }) => Promise<{ threadId: string; output: string }>;
 }
@@ -744,6 +747,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
             repo: event.repo,
             number: event.prNumber,
             instructions: parameters.reviewPrompt,
+            execution: rule.execution,
             signal,
           });
           audit("action", subject, "thread", `bb.review thread ${review.threadId} for ${event.repo}#${event.prNumber}`);
@@ -755,7 +759,7 @@ export function createAutomationEngine(deps: AutomationDeps) {
         if (dryRun) {
           output = `dry-run: would start an agent for ${event.kind} on ${event.repo}:\n${instructions}`;
         } else {
-          const agent = await deps.runAgent({ event, ruleName: rule.name, instructions, signal });
+          const agent = await deps.runAgent({ event, ruleName: rule.name, instructions, execution: rule.execution, signal });
           audit("action", subject, "thread", `bb.agent thread ${agent.threadId} for ${event.kind} on ${event.repo}`);
           output = agent.output;
         }

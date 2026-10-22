@@ -329,6 +329,60 @@ describe("GitHub+ automation tab", () => {
     slot.lifecycle.unmount();
   }, 15_000);
 
+  it.each(["bb.review", "bb.agent"] as const)("saves, reopens, and resets the agent selection for %s", async (action) => {
+    const dashboard = makeDashboard();
+    dashboard.rules = [{ ...dashboard.rules[0]!, actions: [action], repos: ["acme/widgets"], actionParameters: { agentPrompt: "Investigate." } }];
+    const defaults = { providerId: "codex", model: "default-model", reasoningLevel: "medium", serviceTier: "default", permissionMode: "accept-edits" as const };
+    const execution = { providerId: "claude-code", model: "selected-model", reasoningLevel: "high", serviceTier: "fast" };
+    const save = vi.fn((input: unknown) => {
+      const { rules } = automationRpcMethods.automationSaveRules.input.parse(input);
+      dashboard.rules = rules;
+      return { saved: rules.length };
+    });
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "automation" }, {
+      rpc: rpcHandlers(dashboard, { automationSaveRules: save, agentTaskContext: () => ({ projectId: "repo-project", hostId: "repo-host" }) }),
+      sdk: { projects: { defaultExecutionOptions: async () => defaults } },
+    });
+    const open = () => fireEvent.click(slot.getByRole("button", { name: /Review opened and updated pull requests.*action/ }));
+    await slot.findByText("Review opened and updated pull requests", { selector: "p" });
+    open();
+    const choose = await slot.findByRole("button", { name: "Choose provider, model and thinking" });
+    await vi.waitFor(() => expect(choose.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(choose);
+    await slot.findByRole("textbox", { name: "Provider ID" });
+    expect(slot.getByTestId("bb-provider-model-picker").getAttribute("data-routing-id")).toBe("repo-host");
+    for (const [label, value] of [["Provider ID", execution.providerId], ["Model", execution.model], ["Reasoning level", execution.reasoningLevel], ["Service tier", execution.serviceTier]]) {
+      fireEvent.change(slot.getByLabelText(label!), { target: { value } });
+    }
+    fireEvent.click(slot.getByRole("button", { name: "Apply execution selection" }));
+    fireEvent.click(slot.getByRole("button", { name: "Save rules" }));
+    await vi.waitFor(() => expect(dashboard.rules[0]?.execution).toEqual(execution));
+    await vi.waitFor(() => expect(slot.container.querySelector(".gh-automations")?.getAttribute("aria-busy")).not.toBe("true"));
+    open();
+    open();
+    await slot.findByLabelText("Provider ID");
+    expect(slot.getByLabelText("Provider ID")).toHaveProperty("value", execution.providerId);
+    expect(slot.getByLabelText("Model")).toHaveProperty("value", execution.model);
+    expect(slot.getByLabelText("Reasoning level")).toHaveProperty("value", execution.reasoningLevel);
+    fireEvent.click(slot.getByRole("button", { name: "Use project defaults" }));
+    fireEvent.click(slot.getByRole("button", { name: "Save rules" }));
+    await vi.waitFor(() => expect(dashboard.rules[0]?.execution).toBeUndefined());
+    expect(slot.queryByTestId("bb-provider-model-picker")).toBeNull();
+  });
+
+  it("reports unavailable agent catalogs without saving an override", async () => {
+    const dashboard = makeDashboard();
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "automation" }, {
+      rpc: rpcHandlers(dashboard),
+      sdk: { providers: { list: async () => [] } },
+    });
+    fireEvent.click(await slot.findByRole("button", { name: /Review opened and updated pull requests.*action/ }));
+    fireEvent.click(slot.getByRole("button", { name: "Choose provider, model and thinking" }));
+    await slot.findByText("No agent provider is available. Configure one in BB Settings.");
+    expect(slot.queryByTestId("bb-provider-model-picker")).toBeNull();
+    expect(slot.queryByRole("button", { name: "Save rules" })).toBeNull();
+  });
+
   it("surfaces pending approvals on the events page with an approve action", async () => {
     const slot = renderSlot(
       app.navPanels[0]!,

@@ -101,6 +101,13 @@ export interface RuleActionParameters {
   label?: string;
 }
 
+export interface RuleExecution {
+  providerId: string;
+  model: string;
+  reasoningLevel: string;
+  serviceTier?: string;
+}
+
 export interface RuleFilters {
   base?: string;
   head?: string;
@@ -122,6 +129,8 @@ export interface AutomationRule {
   conditionGroups: RuleConditionGroup[];
   actions: ActionKind[];
   actionParameters: RuleActionParameters;
+  /** Omitted to inherit the repository project's agent defaults. */
+  execution?: RuleExecution;
   approvalRequired: boolean;
 }
 
